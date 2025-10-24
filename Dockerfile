@@ -14,7 +14,7 @@ RUN apt-get update && \
         libffi-dev \
         libssl-dev \
         gfortran \
-        libatlas-base-dev \
+        libopenblas-dev \
         liblapack-dev && \
     rm -rf /var/lib/apt/lists/*
 

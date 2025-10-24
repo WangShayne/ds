@@ -1,3 +1,4 @@
 # Ignore runtime monitoring outputs
 *
 !.gitignore
+.env
