@@ -6,7 +6,10 @@ import ccxt
 import pandas as pd
 from datetime import datetime
 import json
+from pathlib import Path
 from dotenv import load_dotenv
+
+from monitoring import update_bot_state
 
 load_dotenv()
 
@@ -35,6 +38,37 @@ TRADE_CONFIG = {
 price_history = []
 signal_history = []
 position = None
+
+BOT_NAME = Path(__file__).stem
+
+
+def sync_monitor(price_data=None, signal_data=None, position_snapshot=None, error=None):
+    """Push the latest runtime snapshot to the shared monitoring store."""
+    try:
+        price_snapshot = None
+        if price_data is not None:
+            if isinstance(price_data, dict):
+                price_snapshot = dict(price_data)
+            else:
+                price_snapshot = price_data
+
+        update_bot_state(
+            BOT_NAME,
+            price_snapshot=price_snapshot,
+            latest_signal=signal_data,
+            signal_history=signal_history[-30:],
+            position=position_snapshot,
+            trade_config=TRADE_CONFIG,
+            metadata={
+                'exchange': 'binance',
+                'script': BOT_NAME,
+                'timeframe': TRADE_CONFIG['timeframe'],
+                'test_mode': TRADE_CONFIG['test_mode'],
+            },
+            error=str(error) if error else None,
+        )
+    except Exception as monitor_err:
+        print(f"监控状态更新失败: {monitor_err}")
 
 
 def setup_exchange():
@@ -236,7 +270,7 @@ def analyze_with_deepseek(price_data):
 
 
 def execute_trade(signal_data, price_data):
-    """执行交易（简化版）"""
+    """执行交易（简化版），返回最新持仓快照。"""
     current_position = get_current_position()
 
     print(f"交易信号: {signal_data['signal']}")
@@ -246,7 +280,7 @@ def execute_trade(signal_data, price_data):
 
     if TRADE_CONFIG['test_mode']:
         print("测试模式 - 仅模拟交易")
-        return
+        return current_position
 
     try:
         # 简化的交易逻辑：只处理单向持仓
@@ -288,17 +322,22 @@ def execute_trade(signal_data, price_data):
 
         elif signal_data['signal'] == 'HOLD':
             print("建议观望，不执行交易")
-            return
+            return current_position
 
         print("订单执行成功")
         time.sleep(2)
-        position = get_current_position()
-        print(f"更新后持仓: {position}")
+        position_after_trade = get_current_position()
+        print(f"更新后持仓: {position_after_trade}")
+        return position_after_trade
 
     except Exception as e:
         print(f"订单执行失败: {e}")
         import traceback
         traceback.print_exc()
+        sync_monitor(price_data=price_data, signal_data=signal_data, position_snapshot=current_position, error=e)
+        return current_position
+
+    return get_current_position()
 
 def trading_bot():
     """主交易机器人函数"""
@@ -309,6 +348,7 @@ def trading_bot():
     # 1. 获取K线数据
     price_data = get_btc_ohlcv()
     if not price_data:
+        sync_monitor(error="获取K线数据失败")
         return
 
     print(f"BTC当前价格: ${price_data['price']:,.2f}")
@@ -318,10 +358,16 @@ def trading_bot():
     # 2. 使用DeepSeek分析
     signal_data = analyze_with_deepseek(price_data)
     if not signal_data:
+        sync_monitor(price_data=price_data, error="DeepSeek分析失败")
         return
 
     # 3. 执行交易
-    execute_trade(signal_data, price_data)
+    position_snapshot = execute_trade(signal_data, price_data)
+    sync_monitor(
+        price_data=price_data,
+        signal_data=signal_data,
+        position_snapshot=position_snapshot,
+    )
 
 
 def main():
@@ -339,7 +385,10 @@ def main():
     # 设置交易所
     if not setup_exchange():
         print("交易所初始化失败，程序退出")
+        sync_monitor(error="交易所初始化失败")
         return
+
+    sync_monitor(position_snapshot=get_current_position())
 
     # 根据时间周期设置执行频率
     if TRADE_CONFIG['timeframe'] == '1h':

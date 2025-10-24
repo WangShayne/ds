@@ -1,12 +1,17 @@
 import os
 import time
 import schedule
+from flask import Flask, jsonify, render_template_string
 from openai import OpenAI
 import ccxt
 import pandas as pd
 from datetime import datetime
 import json
+import threading
+from pathlib import Path
 from dotenv import load_dotenv
+
+from monitoring import update_bot_state
 
 load_dotenv()
 
@@ -35,10 +40,263 @@ TRADE_CONFIG = {
     'test_mode': False,  # 测试模式
 }
 
+MONITOR_CONFIG = {
+    'host': os.getenv('MONITOR_HOST', '0.0.0.0'),
+    'port': int(os.getenv('MONITOR_PORT', 5000)),
+    'refresh_interval': 5,
+}
+
 # 全局变量存储历史数据
 price_history = []
 signal_history = []
 position = None
+
+# 监控数据存储
+monitor_state = {
+    'price_snapshot': None,
+    'latest_signal': None,
+    'position': None,
+    'last_update': None,
+}
+monitor_lock = threading.Lock()
+
+app = Flask(__name__)
+
+BOT_NAME = Path(__file__).stem
+
+
+def update_monitor_state(error=None, **kwargs):
+    """Thread-safe monitor state update and shared monitor sync."""
+    with monitor_lock:
+        monitor_state.update({k: v for k, v in kwargs.items() if v is not None})
+        if error:
+            monitor_state['error'] = str(error)
+        else:
+            monitor_state.pop('error', None)
+
+        snapshot = {
+            'price_snapshot': monitor_state.get('price_snapshot'),
+            'latest_signal': monitor_state.get('latest_signal'),
+            'signal_history': signal_history[-30:],
+            'position': monitor_state.get('position'),
+            'last_update': monitor_state.get('last_update'),
+            'trade_config': TRADE_CONFIG,
+            'metadata': {
+                'exchange': 'okx',
+                'script': BOT_NAME,
+                'timeframe': TRADE_CONFIG['timeframe'],
+                'test_mode': TRADE_CONFIG['test_mode'],
+            },
+        }
+        if monitor_state.get('error'):
+            snapshot['error'] = monitor_state['error']
+
+    try:
+        update_bot_state(BOT_NAME, **snapshot)
+    except Exception as monitor_err:
+        print(f"共享监控状态更新失败: {monitor_err}")
+
+
+def serialize_price_snapshot(price_data):
+    """Prepare price data for JSON responses without mutating globals."""
+    if not price_data:
+        return None
+
+    snapshot = dict(price_data)
+    klines = []
+    for entry in snapshot.get('kline_data', []):
+        formatted = dict(entry)
+        timestamp = formatted.get('timestamp')
+        if hasattr(timestamp, 'strftime'):
+            formatted['timestamp'] = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            formatted['timestamp'] = str(timestamp)
+        klines.append(formatted)
+    snapshot['kline_data'] = klines
+    return snapshot
+
+
+@app.route('/api/status')
+def api_status():
+    with monitor_lock:
+        data = {
+            'price_snapshot': monitor_state['price_snapshot'],
+            'latest_signal': monitor_state['latest_signal'],
+            'signal_history': signal_history[-10:],
+            'position': monitor_state['position'],
+            'last_update': monitor_state['last_update'],
+            'trade_config': TRADE_CONFIG,
+            'error': monitor_state.get('error'),
+        }
+    return jsonify(data)
+
+
+@app.route('/')
+def monitor_dashboard():
+    refresh = MONITOR_CONFIG['refresh_interval'] * 1000
+    html = """
+    <!doctype html>
+    <html lang="zh">
+    <head>
+        <meta charset="utf-8">
+        <title>OKX 策略监控</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 2rem; background: #0f172a; color: #e2e8f0; }
+            h1 { font-size: 1.8rem; margin-bottom: 1rem; }
+            .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+            .card { background: #1e293b; padding: 1rem; border-radius: 0.5rem; box-shadow: 0 6px 16px rgba(15, 23, 42, 0.4); }
+            .label { color: #94a3b8; font-size: 0.85rem; }
+            .value { font-size: 1.2rem; margin-top: 0.4rem; font-weight: 600; }
+            table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+            th, td { border-bottom: 1px solid #334155; padding: 0.5rem; text-align: left; }
+            th { color: #cbd5f5; }
+            tr:hover { background: rgba(148, 163, 184, 0.1); }
+            .signal-buy { color: #34d399; }
+            .signal-sell { color: #f87171; }
+            .signal-hold { color: #facc15; }
+            .timestamp { font-size: 0.8rem; color: #64748b; }
+        </style>
+    </head>
+    <body>
+        <h1>OKX 策略监控面板</h1>
+        <p class="timestamp">最后更新: <span id="last-update">-</span></p>
+        <div class="grid">
+            <div class="card">
+                <div class="label">当前价格</div>
+                <div id="current-price" class="value">-</div>
+                <div class="label">价格变化</div>
+                <div id="price-change" class="value">-</div>
+            </div>
+            <div class="card">
+                <div class="label">最新信号</div>
+                <div id="latest-signal" class="value">-</div>
+                <div class="label">信号描述</div>
+                <div id="latest-reason"></div>
+            </div>
+            <div class="card">
+                <div class="label">当前持仓</div>
+                <div id="current-position" class="value">-</div>
+                <div class="label">浮动盈亏</div>
+                <div id="unrealized-pnl" class="value">-</div>
+            </div>
+        </div>
+
+        <div class="card" style="margin-top: 1.5rem;">
+            <h2>近期信号</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>时间</th>
+                        <th>信号</th>
+                        <th>信心</th>
+                        <th>止损</th>
+                        <th>止盈</th>
+                    </tr>
+                </thead>
+                <tbody id="signal-history"></tbody>
+            </table>
+        </div>
+
+        <div class="card" style="margin-top: 1.5rem;">
+            <h2>最近K线</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>时间</th>
+                        <th>开盘</th>
+                        <th>收盘</th>
+                        <th>最高</th>
+                        <th>最低</th>
+                        <th>成交量</th>
+                    </tr>
+                </thead>
+                <tbody id="kline-data"></tbody>
+            </table>
+        </div>
+
+        <script>
+            const refreshInterval = {{ refresh }};
+
+            function formatSignal(signal) {
+                if (!signal) return '-';
+                const map = {
+                    'BUY': 'signal-buy',
+                    'SELL': 'signal-sell',
+                    'HOLD': 'signal-hold'
+                };
+                const cls = map[signal.toUpperCase()] || '';
+                return `<span class="${cls}">${signal}</span>`;
+            }
+
+            async function fetchStatus() {
+                try {
+                    const res = await fetch('/api/status');
+                    const data = await res.json();
+
+                    document.getElementById('last-update').textContent = data.last_update || '-';
+
+                    const price = data.price_snapshot || {};
+                    document.getElementById('current-price').textContent = price.price ? `$${price.price.toFixed(2)}` : '-';
+                    document.getElementById('price-change').textContent = price.price_change ? `${price.price_change.toFixed(2)}%` : '-';
+
+                    const latestSignal = data.latest_signal;
+                    document.getElementById('latest-signal').innerHTML = latestSignal ? formatSignal(latestSignal.signal) : '-';
+                    document.getElementById('latest-reason').textContent = latestSignal ? latestSignal.reason : '-';
+
+                    const position = data.position;
+                    document.getElementById('current-position').textContent = position ? `${position.side} ${position.size}` : '无持仓';
+                    document.getElementById('unrealized-pnl').textContent = position ? `${position.unrealized_pnl.toFixed(2)} USDT` : '-';
+
+                    const historyBody = document.getElementById('signal-history');
+                    historyBody.innerHTML = '';
+                    (data.signal_history || []).slice().reverse().forEach(item => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td>${item.timestamp || '-'}</td>
+                            <td>${formatSignal(item.signal || '-')}</td>
+                            <td>${item.confidence || '-'}</td>
+                            <td>${item.stop_loss ? `$${item.stop_loss.toFixed(2)}` : '-'}</td>
+                            <td>${item.take_profit ? `$${item.take_profit.toFixed(2)}` : '-'}</td>
+                        `;
+                        historyBody.appendChild(tr);
+                    });
+
+                    const klineBody = document.getElementById('kline-data');
+                    klineBody.innerHTML = '';
+                    (price.kline_data || []).slice().reverse().forEach(item => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td>${item.timestamp || '-'}</td>
+                            <td>${Number(item.open).toFixed(2)}</td>
+                            <td>${Number(item.close).toFixed(2)}</td>
+                            <td>${Number(item.high).toFixed(2)}</td>
+                            <td>${Number(item.low).toFixed(2)}</td>
+                            <td>${Number(item.volume).toFixed(4)}</td>
+                        `;
+                        klineBody.appendChild(tr);
+                    });
+                } catch (err) {
+                    console.error('Failed to fetch status', err);
+                }
+            }
+
+            fetchStatus();
+            setInterval(fetchStatus, refreshInterval);
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html, refresh=refresh)
+
+
+def start_monitor_server():
+    """Launch the Flask monitoring server in a background thread."""
+    def run():
+        app.run(host=MONITOR_CONFIG['host'], port=MONITOR_CONFIG['port'], debug=False, use_reloader=False)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    print(f"Web监控已启动: http://{MONITOR_CONFIG['host']}:{MONITOR_CONFIG['port']}")
 
 
 def setup_exchange():
@@ -243,7 +501,7 @@ def execute_trade(signal_data, price_data):
 
     if TRADE_CONFIG['test_mode']:
         print("测试模式 - 仅模拟交易")
-        return
+        return current_position
 
     try:
         if signal_data['signal'] == 'BUY':
@@ -306,18 +564,23 @@ def execute_trade(signal_data, price_data):
 
         elif signal_data['signal'] == 'HOLD':
             print("建议观望，不执行交易")
-            return
+            return current_position
 
         print("订单执行成功")
         # 更新持仓信息
         time.sleep(2)
         position = get_current_position()
         print(f"更新后持仓: {position}")
+        return position
 
     except Exception as e:
         print(f"订单执行失败: {e}")
         import traceback
         traceback.print_exc()
+        update_monitor_state(error=e)
+        return current_position
+
+    return get_current_position()
 
 
 def trading_bot():
@@ -329,19 +592,40 @@ def trading_bot():
     # 1. 获取K线数据
     price_data = get_btc_ohlcv()
     if not price_data:
+        update_monitor_state(
+            signal_history=signal_history[-30:],
+            last_update=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            error="获取K线数据失败",
+        )
         return
 
     print(f"BTC当前价格: ${price_data['price']:,.2f}")
     print(f"数据周期: {TRADE_CONFIG['timeframe']}")
     print(f"价格变化: {price_data['price_change']:+.2f}%")
 
+    serialized_price = serialize_price_snapshot(price_data)
+
     # 2. 使用DeepSeek分析
     signal_data = analyze_with_deepseek(price_data)
     if not signal_data:
+        update_monitor_state(
+            price_snapshot=serialized_price,
+            signal_history=signal_history[-30:],
+            last_update=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            error="DeepSeek分析失败",
+        )
         return
 
     # 3. 执行交易
-    execute_trade(signal_data, price_data)
+    position_snapshot = execute_trade(signal_data, price_data)
+    update_monitor_state(
+        price_snapshot=serialized_price,
+        latest_signal=signal_data,
+        signal_history=signal_history[-30:],
+        position=position_snapshot,
+        last_update=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        error=None,
+    )
 
 
 def main():
@@ -359,7 +643,15 @@ def main():
     # 设置交易所
     if not setup_exchange():
         print("交易所初始化失败，程序退出")
+        update_monitor_state(error="交易所初始化失败")
         return
+
+    update_monitor_state(
+        position=get_current_position(),
+        signal_history=signal_history[-30:],
+        last_update=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        error=None,
+    )
 
     # 根据时间周期设置执行频率
     if TRADE_CONFIG['timeframe'] == '1h':

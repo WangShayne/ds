@@ -7,7 +7,10 @@ import pandas as pd
 from datetime import datetime
 import json
 import re
+from pathlib import Path
 from dotenv import load_dotenv
+
+from monitoring import update_bot_state
 
 load_dotenv()
 
@@ -46,6 +49,40 @@ TRADE_CONFIG = {
 price_history = []
 signal_history = []
 position = None
+
+BOT_NAME = Path(__file__).stem
+
+
+def sync_monitor(price_data=None, signal_data=None, position_snapshot=None, error=None, extra_metrics=None):
+    """Persist monitoring data for the enhanced OKX strategy."""
+    try:
+        price_snapshot = None
+        if price_data is not None:
+            if isinstance(price_data, dict):
+                price_snapshot = dict(price_data)
+                price_snapshot.pop('full_data', None)
+            else:
+                price_snapshot = price_data
+
+        payload = {
+            'price_snapshot': price_snapshot,
+            'latest_signal': signal_data,
+            'signal_history': signal_history[-30:],
+            'position': position_snapshot,
+            'trade_config': TRADE_CONFIG,
+            'metadata': {
+                'exchange': 'okx',
+                'script': BOT_NAME,
+                'timeframe': TRADE_CONFIG['timeframe'],
+                'test_mode': TRADE_CONFIG['test_mode'],
+            },
+            'error': str(error) if error else None,
+        }
+        if extra_metrics:
+            payload['metadata'].update(extra_metrics)
+        update_bot_state(BOT_NAME, **payload)
+    except Exception as monitor_err:
+        print(f"监控状态更新失败: {monitor_err}")
 
 
 def setup_exchange():
@@ -463,11 +500,11 @@ def execute_trade(signal_data, price_data):
     # 风险管理：低信心信号不执行
     if signal_data['confidence'] == 'LOW' and not TRADE_CONFIG['test_mode']:
         print("⚠️ 低信心信号，跳过执行")
-        return
+        return current_position
 
     if TRADE_CONFIG['test_mode']:
         print("测试模式 - 仅模拟交易")
-        return
+        return current_position
 
     try:
         # 获取账户余额
@@ -507,7 +544,7 @@ def execute_trade(signal_data, price_data):
 
         elif signal_data['signal'] == 'HOLD':
             print("建议观望，不执行交易")
-            return
+            return current_position
 
         print(f"操作类型: {operation_type}, 需要保证金: {required_margin:.2f} USDT")
 
@@ -515,7 +552,7 @@ def execute_trade(signal_data, price_data):
         if required_margin > 0:
             if required_margin > usdt_balance * 0.8:
                 print(f"⚠️ 保证金不足，跳过交易。需要: {required_margin:.2f} USDT, 可用: {usdt_balance:.2f} USDT")
-                return
+                return current_position
         else:
             print("✅ 无需额外保证金，继续执行")
 
@@ -584,11 +621,16 @@ def execute_trade(signal_data, price_data):
         time.sleep(2)
         position = get_current_position()
         print(f"更新后持仓: {position}")
+        return position
 
     except Exception as e:
         print(f"订单执行失败: {e}")
         import traceback
         traceback.print_exc()
+        sync_monitor(price_data=price_data, signal_data=signal_data, position_snapshot=current_position, error=e)
+        return current_position
+
+    return get_current_position()
 
 
 def analyze_with_deepseek_with_retry(price_data, max_retries=2):
@@ -620,6 +662,7 @@ def trading_bot():
     # 1. 获取增强版K线数据
     price_data = get_btc_ohlcv_enhanced()
     if not price_data:
+        sync_monitor(error="获取增强K线数据失败")
         return
 
     print(f"BTC当前价格: ${price_data['price']:,.2f}")
@@ -633,7 +676,20 @@ def trading_bot():
         print("⚠️ 使用备用交易信号")
 
     # 3. 执行交易
-    execute_trade(signal_data, price_data)
+    position_snapshot = execute_trade(signal_data, price_data)
+    extra_metrics = {
+        'overall_trend': price_data.get('trend_analysis', {}).get('overall'),
+        'short_term_trend': price_data.get('trend_analysis', {}).get('short_term'),
+        'rsi': price_data.get('technical_data', {}).get('rsi'),
+        'is_fallback_signal': signal_data.get('is_fallback', False),
+    }
+    sync_monitor(
+        price_data=price_data,
+        signal_data=signal_data,
+        position_snapshot=position_snapshot,
+        error=None,
+        extra_metrics=extra_metrics,
+    )
 
 
 def main():
@@ -652,7 +708,14 @@ def main():
     # 设置交易所
     if not setup_exchange():
         print("交易所初始化失败，程序退出")
+        sync_monitor(error="交易所初始化失败")
         return
+
+    sync_monitor(
+        position_snapshot=get_current_position(),
+        error=None,
+        extra_metrics={'initialised': True},
+    )
 
     # 根据时间周期设置执行频率
     if TRADE_CONFIG['timeframe'] == '1h':

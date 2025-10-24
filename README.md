@@ -59,3 +59,14 @@
 ### npm install pm2 -g 使用npm安装pm2
 
 ### conda create -n trail3 python=4.10
+
+### Web 监控面板
+
+- 运行 `python -m monitoring.server` 启动统一的 Web 监控（默认监听 `0.0.0.0:8000`，5 秒刷新一次）。
+- 任意交易脚本在每次执行周期内都会自动推送行情、信号、持仓、错误信息至监控面板。
+- 可通过环境变量自定义行为：`MONITOR_HOST`、`MONITOR_PORT`、`MONITOR_REFRESH_SECONDS`、`MONITOR_STATUS_FILE`。
+- 监控面板展示最近信号列表、最新行情与各版本策略的运行状态，可结合 `pm2 logs` 快速排查异常。
+
+### Docker Compose 部署
+
+- 使用 `docker compose` 进行容器化部署，请参考 `docs/DEPLOYMENT.md`。
