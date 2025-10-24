@@ -98,8 +98,23 @@ def setup_exchange():
 
         # 获取余额
         balance = exchange.fetch_balance()
-        usdt_balance = balance['USDT']['free']
-        print(f"当前USDT余额: {usdt_balance:.2f}")
+
+        usdt_balance = None
+        # OKX在不同账户模式下字段可能不同，逐项尝试
+        if isinstance(balance, dict):
+            usdt_entry = balance.get('USDT') or balance.get('USDT:USDT')
+            if isinstance(usdt_entry, dict):
+                usdt_balance = usdt_entry.get('free') or usdt_entry.get('total')
+
+            if usdt_balance is None:
+                free_map = balance.get('free') or {}
+                total_map = balance.get('total') or {}
+                usdt_balance = free_map.get('USDT') or total_map.get('USDT')
+
+        if usdt_balance is None:
+            raise KeyError(f"未找到USDT余额字段，可用字段: {list(balance.keys())}")
+
+        print(f"当前USDT余额: {float(usdt_balance):.2f}")
 
         return True
     except Exception as e:
