@@ -580,7 +580,12 @@ def execute_trade(signal_data, price_data):
                     TRADE_CONFIG['symbol'],
                     'buy',
                     current_position['size'],
-                    params={'reduceOnly': True, 'tag': 'f1ee03b510d5SUDE'}
+                    params={
+                        'reduceOnly': True,
+                        'posSide': 'short',
+                        'tdMode': 'cross',
+                        'tag': 'f1ee03b510d5SUDE'
+                    }
                 )
                 time.sleep(1)
                 # 开多仓
@@ -588,7 +593,11 @@ def execute_trade(signal_data, price_data):
                     TRADE_CONFIG['symbol'],
                     'buy',
                     TRADE_CONFIG['amount'],
-                    params={'tag': 'f1ee03b510d5SUDE'}
+                    params={
+                        'posSide': 'long',
+                        'tdMode': 'cross',
+                        'tag': 'f1ee03b510d5SUDE'
+                    }
                 )
             elif current_position and current_position['side'] == 'long':
                 print("已有多头持仓，保持现状")
@@ -599,7 +608,11 @@ def execute_trade(signal_data, price_data):
                     TRADE_CONFIG['symbol'],
                     'buy',
                     TRADE_CONFIG['amount'],
-                    params={'tag': 'f1ee03b510d5SUDE'}
+                    params={
+                        'posSide': 'long',
+                        'tdMode': 'cross',
+                        'tag': 'f1ee03b510d5SUDE'
+                    }
                 )
 
         elif signal_data['signal'] == 'SELL':
@@ -610,7 +623,12 @@ def execute_trade(signal_data, price_data):
                     TRADE_CONFIG['symbol'],
                     'sell',
                     current_position['size'],
-                    params={'reduceOnly': True, 'tag': 'f1ee03b510d5SUDE'}
+                    params={
+                        'reduceOnly': True,
+                        'posSide': 'long',
+                        'tdMode': 'cross',
+                        'tag': 'f1ee03b510d5SUDE'
+                    }
                 )
                 time.sleep(1)
                 # 开空仓
@@ -618,7 +636,11 @@ def execute_trade(signal_data, price_data):
                     TRADE_CONFIG['symbol'],
                     'sell',
                     TRADE_CONFIG['amount'],
-                    params={'tag': 'f1ee03b510d5SUDE'}
+                    params={
+                        'posSide': 'short',
+                        'tdMode': 'cross',
+                        'tag': 'f1ee03b510d5SUDE'
+                    }
                 )
             elif current_position and current_position['side'] == 'short':
                 print("已有空头持仓，保持现状")
@@ -629,7 +651,11 @@ def execute_trade(signal_data, price_data):
                     TRADE_CONFIG['symbol'],
                     'sell',
                     TRADE_CONFIG['amount'],
-                    params={'tag': 'f1ee03b510d5SUDE'}
+                    params={
+                        'posSide': 'short',
+                        'tdMode': 'cross',
+                        'tag': 'f1ee03b510d5SUDE'
+                    }
                 )
 
         print("订单执行成功")
