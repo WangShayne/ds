@@ -1,10 +1,11 @@
 import os
 import time
+from collections import deque
 import schedule
 from openai import OpenAI
 import ccxt
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import re
 from pathlib import Path
@@ -50,7 +51,133 @@ price_history = []
 signal_history = []
 position = None
 
+order_history = deque(maxlen=30)
+runtime_log = deque(maxlen=100)
+deepseek_log = deque(maxlen=20)
+account_snapshot = {}
+
 BOT_NAME = Path(__file__).stem
+
+
+def log_event(message, level="INFO", also_print=True):
+    """记录运行日志并可选输出到控制台。"""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    entry = {
+        'timestamp': timestamp,
+        'level': level,
+        'message': str(message),
+    }
+    runtime_log.append(entry)
+    if also_print:
+        print(f"[{timestamp}] [{level}] {message}")
+
+
+def record_order(action, side, amount, params=None, response=None, note=None):
+    """保存订单执行结果到历史记录。"""
+    params = params or {}
+    entry = {
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'action': action,
+        'side': side,
+        'amount': float(amount) if amount is not None else None,
+        'symbol': response.get('symbol') if isinstance(response, dict) else TRADE_CONFIG['symbol'],
+        'posSide': params.get('posSide'),
+        'reduceOnly': params.get('reduceOnly'),
+        'tdMode': params.get('tdMode'),
+        'note': note or action,
+    }
+
+    if isinstance(response, dict):
+        entry['id'] = response.get('id') or response.get('orderId')
+        status = response.get('status')
+        info = response.get('info') or {}
+        if not status and isinstance(info, dict):
+            status = info.get('state') or info.get('status')
+        entry['status'] = status
+
+        price = response.get('price')
+        filled = response.get('filled')
+        cost = response.get('cost')
+        entry['price'] = float(price) if price not in (None, '') else None
+        entry['filled'] = float(filled) if filled not in (None, '') else None
+        entry['cost'] = float(cost) if cost not in (None, '') else None
+
+        if isinstance(info, dict):
+            entry['exchangeMessage'] = info.get('sMsg') or info.get('msg')
+            entry['code'] = info.get('sCode') or info.get('code')
+
+        fee = response.get('fee')
+        if isinstance(fee, dict):
+            entry['fee'] = {
+                'cost': fee.get('cost'),
+                'currency': fee.get('currency'),
+            }
+
+    order_history.append(entry)
+
+
+def record_deepseek(prompt_text, response_text, status="success"):
+    """记录与DeepSeek的通讯信息（截断以便展示）。"""
+    status = (status or "info").upper()
+    def _trim(text, limit=600):
+        if text is None:
+            return None
+        text = str(text)
+        return text if len(text) <= limit else text[:limit] + "..."
+
+    deepseek_log.append({
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'status': status,
+        'prompt': _trim(prompt_text, 700),
+        'response': _trim(response_text, 700),
+    })
+
+
+def update_account_snapshot(balance=None, usdt_balance=None, position_snapshot=None):
+    """更新账户视图数据，供监控展示收益与持仓。"""
+    snapshot = {
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'currency': 'USDT',
+    }
+
+    if usdt_balance is not None:
+        try:
+            snapshot['available'] = float(usdt_balance)
+        except (TypeError, ValueError):
+            snapshot['available'] = usdt_balance
+
+    if isinstance(balance, dict):
+        free_map = balance.get('free') or {}
+        total_map = balance.get('total') or {}
+        used_map = balance.get('used') or {}
+        for label, value in (('free', free_map.get('USDT')), ('total', total_map.get('USDT')), ('used', used_map.get('USDT'))):
+            if value is not None:
+                try:
+                    snapshot[label] = float(value)
+                except (TypeError, ValueError):
+                    snapshot[label] = value
+
+        info = balance.get('info')
+        if isinstance(info, dict):
+            equity = info.get('equity') or info.get('totalEq')
+            if equity is not None:
+                try:
+                    snapshot['equity'] = float(equity)
+                except (TypeError, ValueError):
+                    snapshot['equity'] = equity
+
+    if position_snapshot:
+        pnl = position_snapshot.get('unrealized_pnl')
+        if pnl is not None:
+            try:
+                snapshot['unrealized_pnl'] = float(pnl)
+            except (TypeError, ValueError):
+                snapshot['unrealized_pnl'] = pnl
+        snapshot['position_side'] = position_snapshot.get('side')
+        snapshot['position_size'] = position_snapshot.get('size')
+        snapshot['entry_price'] = position_snapshot.get('entry_price')
+
+    account_snapshot.update({k: v for k, v in snapshot.items() if v is not None})
 
 
 def sync_monitor(price_data=None, signal_data=None, position_snapshot=None, error=None, extra_metrics=None):
@@ -75,14 +202,21 @@ def sync_monitor(price_data=None, signal_data=None, position_snapshot=None, erro
                 'script': BOT_NAME,
                 'timeframe': TRADE_CONFIG['timeframe'],
                 'test_mode': TRADE_CONFIG['test_mode'],
+                'order_history_size': len(order_history),
+                'log_entries': len(runtime_log),
+                'deepseek_logs': len(deepseek_log),
             },
             'error': str(error) if error else None,
+            'orders': list(order_history),
+            'logs': list(runtime_log),
+            'deepseek_messages': list(deepseek_log),
+            'account': dict(account_snapshot) if account_snapshot else None,
         }
         if extra_metrics:
             payload['metadata'].update(extra_metrics)
         update_bot_state(BOT_NAME, **payload)
     except Exception as monitor_err:
-        print(f"监控状态更新失败: {monitor_err}")
+        log_event(f"监控状态更新失败: {monitor_err}", level="ERROR", also_print=True)
 
 
 def setup_exchange():
@@ -94,7 +228,7 @@ def setup_exchange():
             TRADE_CONFIG['symbol'],
             {'mgnMode': 'cross'}  # 全仓模式
         )
-        print(f"设置杠杆倍数: {TRADE_CONFIG['leverage']}x")
+        log_event(f"设置杠杆倍数: {TRADE_CONFIG['leverage']}x")
 
         # 获取余额
         balance = exchange.fetch_balance()
@@ -114,11 +248,12 @@ def setup_exchange():
         if usdt_balance is None:
             raise KeyError(f"未找到USDT余额字段，可用字段: {list(balance.keys())}")
 
-        print(f"当前USDT余额: {float(usdt_balance):.2f}")
+        log_event(f"当前USDT余额: {float(usdt_balance):.2f}")
+        update_account_snapshot(balance=balance, usdt_balance=usdt_balance, position_snapshot=get_current_position())
 
         return True
     except Exception as e:
-        print(f"交易所设置失败: {e}")
+        log_event(f"交易所设置失败: {e}", level="ERROR")
         return False
 
 
@@ -164,7 +299,7 @@ def calculate_technical_indicators(df):
 
         return df
     except Exception as e:
-        print(f"技术指标计算失败: {e}")
+        log_event(f"技术指标计算失败: {e}", level="ERROR")
         return df
 
 
@@ -191,7 +326,7 @@ def get_support_resistance_levels(df, lookback=20):
             'price_vs_support': ((current_price - support_level) / support_level) * 100
         }
     except Exception as e:
-        print(f"支撑阻力计算失败: {e}")
+        log_event(f"支撑阻力计算失败: {e}", level="ERROR")
         return {}
 
 
@@ -223,7 +358,7 @@ def get_market_trend(df):
             'rsi_level': df['rsi'].iloc[-1]
         }
     except Exception as e:
-        print(f"趋势分析失败: {e}")
+        log_event(f"趋势分析失败: {e}", level="ERROR")
         return {}
 
 
@@ -235,7 +370,8 @@ def get_btc_ohlcv_enhanced():
                                      limit=TRADE_CONFIG['data_points'])
 
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        # Convert exchange timestamps to timezone-aware UTC to satisfy monitoring serialization
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
 
         # 计算技术指标
         df = calculate_technical_indicators(df)
@@ -247,6 +383,9 @@ def get_btc_ohlcv_enhanced():
         trend_analysis = get_market_trend(df)
         levels_analysis = get_support_resistance_levels(df)
 
+        kline_records = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].tail(10).copy()
+        kline_records['timestamp'] = kline_records['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+
         return {
             'price': current_data['close'],
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -255,7 +394,7 @@ def get_btc_ohlcv_enhanced():
             'volume': current_data['volume'],
             'timeframe': TRADE_CONFIG['timeframe'],
             'price_change': ((current_data['close'] - previous_data['close']) / previous_data['close']) * 100,
-            'kline_data': df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].tail(10).to_dict('records'),
+            'kline_data': kline_records.to_dict('records'),
             'technical_data': {
                 'sma_5': current_data.get('sma_5', 0),
                 'sma_20': current_data.get('sma_20', 0),
@@ -274,7 +413,7 @@ def get_btc_ohlcv_enhanced():
             'full_data': df
         }
     except Exception as e:
-        print(f"获取增强K线数据失败: {e}")
+        log_event(f"获取增强K线数据失败: {e}", level="ERROR")
         return None
 
 
@@ -340,7 +479,7 @@ def get_current_position():
         return None
 
     except Exception as e:
-        print(f"获取持仓失败: {e}")
+        log_event(f"获取持仓失败: {e}", level="ERROR")
         import traceback
         traceback.print_exc()
         return None
@@ -359,8 +498,8 @@ def safe_json_parse(json_str):
             json_str = re.sub(r',\s*]', ']', json_str)
             return json.loads(json_str)
         except json.JSONDecodeError as e:
-            print(f"JSON解析失败，原始内容: {json_str}")
-            print(f"错误详情: {e}")
+            log_event(f"JSON解析失败，原始内容: {json_str}", level="ERROR", also_print=False)
+            log_event(f"错误详情: {e}", level="ERROR", also_print=False)
             return None
 
 
@@ -455,7 +594,7 @@ def analyze_with_deepseek(price_data):
 
         # 安全解析JSON
         result = response.choices[0].message.content
-        print(f"DeepSeek原始回复: {result}")
+        log_event("DeepSeek请求已完成，正在解析结果", level="DEBUG")
 
         # 提取JSON部分
         start_idx = result.find('{')
@@ -480,22 +619,24 @@ def analyze_with_deepseek(price_data):
         signal_history.append(signal_data)
         if len(signal_history) > 30:
             signal_history.pop(0)
+        record_deepseek(prompt, result, status="success")
 
         # 信号统计
         signal_count = len([s for s in signal_history if s.get('signal') == signal_data['signal']])
         total_signals = len(signal_history)
-        print(f"信号统计: {signal_data['signal']} (最近{total_signals}次中出现{signal_count}次)")
+        log_event(f"信号统计: {signal_data['signal']} (最近{total_signals}次中出现{signal_count}次)", level="DEBUG")
 
         # 信号连续性检查
         if len(signal_history) >= 3:
             last_three = [s['signal'] for s in signal_history[-3:]]
             if len(set(last_three)) == 1:
-                print(f"⚠️ 注意：连续3次{signal_data['signal']}信号")
+                log_event(f"⚠️ 注意：连续3次{signal_data['signal']}信号", level="WARNING")
 
         return signal_data
 
     except Exception as e:
-        print(f"DeepSeek分析失败: {e}")
+        log_event(f"DeepSeek分析失败: {e}", level="ERROR")
+        record_deepseek(prompt, str(e), status="error")
         return create_fallback_signal(price_data)
 
 
@@ -505,26 +646,27 @@ def execute_trade(signal_data, price_data):
 
     current_position = get_current_position()
 
-    print(f"交易信号: {signal_data['signal']}")
-    print(f"信心程度: {signal_data['confidence']}")
-    print(f"理由: {signal_data['reason']}")
-    print(f"止损: ${signal_data['stop_loss']:,.2f}")
-    print(f"止盈: ${signal_data['take_profit']:,.2f}")
-    print(f"当前持仓: {current_position}")
+    log_event(f"交易信号: {signal_data['signal']}")
+    log_event(f"信心程度: {signal_data['confidence']}", level="DEBUG")
+    log_event(f"理由: {signal_data['reason']}", level="DEBUG")
+    log_event(f"止损: ${signal_data['stop_loss']:,.2f}", level="DEBUG")
+    log_event(f"止盈: ${signal_data['take_profit']:,.2f}", level="DEBUG")
+    log_event(f"当前持仓: {current_position}", level="DEBUG")
 
     # 风险管理：低信心信号不执行
     if signal_data['confidence'] == 'LOW' and not TRADE_CONFIG['test_mode']:
-        print("⚠️ 低信心信号，跳过执行")
+        log_event("⚠️ 低信心信号，跳过执行", level="WARNING")
         return current_position
 
     if TRADE_CONFIG['test_mode']:
-        print("测试模式 - 仅模拟交易")
+        log_event("测试模式 - 仅模拟交易", level="INFO")
         return current_position
 
     try:
         # 获取账户余额
         balance = exchange.fetch_balance()
         usdt_balance = balance['USDT']['free']
+        update_account_snapshot(balance=balance, usdt_balance=usdt_balance, position_snapshot=current_position)
 
         # 智能保证金检查
         required_margin = 0
@@ -558,114 +700,127 @@ def execute_trade(signal_data, price_data):
                 operation_type = "保持空仓"
 
         elif signal_data['signal'] == 'HOLD':
-            print("建议观望，不执行交易")
+            log_event("建议观望，不执行交易", level="INFO")
             return current_position
 
-        print(f"操作类型: {operation_type}, 需要保证金: {required_margin:.2f} USDT")
+        log_event(f"操作类型: {operation_type}, 需要保证金: {required_margin:.2f} USDT", level="DEBUG")
 
         # 只有在需要额外保证金时才检查
         if required_margin > 0:
             if required_margin > usdt_balance * 0.8:
-                print(f"⚠️ 保证金不足，跳过交易。需要: {required_margin:.2f} USDT, 可用: {usdt_balance:.2f} USDT")
+                log_event(f"⚠️ 保证金不足，跳过交易。需要: {required_margin:.2f} USDT, 可用: {usdt_balance:.2f} USDT", level="WARNING")
                 return current_position
         else:
-            print("✅ 无需额外保证金，继续执行")
+            log_event("✅ 无需额外保证金，继续执行", level="INFO")
 
         # 执行交易逻辑   tag 是我的经纪商api（不拿白不拿），不会影响大家返佣，介意可以删除
         if signal_data['signal'] == 'BUY':
             if current_position and current_position['side'] == 'short':
-                print("平空仓并开多仓...")
+                log_event("平空仓并开多仓...")
                 # 平空仓
-                exchange.create_market_order(
+                close_params = {
+                    'reduceOnly': True,
+                    'posSide': 'short',
+                    'tdMode': 'cross',
+                    'tag': 'f1ee03b510d5SUDE'
+                }
+                response_close = exchange.create_market_order(
                     TRADE_CONFIG['symbol'],
                     'buy',
                     current_position['size'],
-                    params={
-                        'reduceOnly': True,
-                        'posSide': 'short',
-                        'tdMode': 'cross',
-                        'tag': 'f1ee03b510d5SUDE'
-                    }
+                    params=close_params
                 )
+                record_order("close_short", 'buy', current_position['size'], params=close_params, response=response_close, note="平空仓")
                 time.sleep(1)
                 # 开多仓
-                exchange.create_market_order(
+                open_params = {
+                    'posSide': 'long',
+                    'tdMode': 'cross',
+                    'tag': 'f1ee03b510d5SUDE'
+                }
+                response_open = exchange.create_market_order(
                     TRADE_CONFIG['symbol'],
                     'buy',
                     TRADE_CONFIG['amount'],
-                    params={
-                        'posSide': 'long',
-                        'tdMode': 'cross',
-                        'tag': 'f1ee03b510d5SUDE'
-                    }
+                    params=open_params
                 )
+                record_order("open_long", 'buy', TRADE_CONFIG['amount'], params=open_params, response=response_open, note="开多仓")
             elif current_position and current_position['side'] == 'long':
-                print("已有多头持仓，保持现状")
+                log_event("已有多头持仓，保持现状", level="INFO")
             else:
                 # 无持仓时开多仓
-                print("开多仓...")
-                exchange.create_market_order(
+                log_event("开多仓...")
+                open_params = {
+                    'posSide': 'long',
+                    'tdMode': 'cross',
+                    'tag': 'f1ee03b510d5SUDE'
+                }
+                response_open = exchange.create_market_order(
                     TRADE_CONFIG['symbol'],
                     'buy',
                     TRADE_CONFIG['amount'],
-                    params={
-                        'posSide': 'long',
-                        'tdMode': 'cross',
-                        'tag': 'f1ee03b510d5SUDE'
-                    }
+                    params=open_params
                 )
+                record_order("open_long", 'buy', TRADE_CONFIG['amount'], params=open_params, response=response_open, note="开多仓")
 
         elif signal_data['signal'] == 'SELL':
             if current_position and current_position['side'] == 'long':
-                print("平多仓并开空仓...")
+                log_event("平多仓并开空仓...")
                 # 平多仓
-                exchange.create_market_order(
+                close_params = {
+                    'reduceOnly': True,
+                    'posSide': 'long',
+                    'tdMode': 'cross',
+                    'tag': 'f1ee03b510d5SUDE'
+                }
+                response_close = exchange.create_market_order(
                     TRADE_CONFIG['symbol'],
                     'sell',
                     current_position['size'],
-                    params={
-                        'reduceOnly': True,
-                        'posSide': 'long',
-                        'tdMode': 'cross',
-                        'tag': 'f1ee03b510d5SUDE'
-                    }
+                    params=close_params
                 )
+                record_order("close_long", 'sell', current_position['size'], params=close_params, response=response_close, note="平多仓")
                 time.sleep(1)
                 # 开空仓
-                exchange.create_market_order(
+                open_params = {
+                    'posSide': 'short',
+                    'tdMode': 'cross',
+                    'tag': 'f1ee03b510d5SUDE'
+                }
+                response_open = exchange.create_market_order(
                     TRADE_CONFIG['symbol'],
                     'sell',
                     TRADE_CONFIG['amount'],
-                    params={
-                        'posSide': 'short',
-                        'tdMode': 'cross',
-                        'tag': 'f1ee03b510d5SUDE'
-                    }
+                    params=open_params
                 )
+                record_order("open_short", 'sell', TRADE_CONFIG['amount'], params=open_params, response=response_open, note="开空仓")
             elif current_position and current_position['side'] == 'short':
-                print("已有空头持仓，保持现状")
+                log_event("已有空头持仓，保持现状", level="INFO")
             else:
                 # 无持仓时开空仓
-                print("开空仓...")
-                exchange.create_market_order(
+                log_event("开空仓...")
+                open_params = {
+                    'posSide': 'short',
+                    'tdMode': 'cross',
+                    'tag': 'f1ee03b510d5SUDE'
+                }
+                response_open = exchange.create_market_order(
                     TRADE_CONFIG['symbol'],
                     'sell',
                     TRADE_CONFIG['amount'],
-                    params={
-                        'posSide': 'short',
-                        'tdMode': 'cross',
-                        'tag': 'f1ee03b510d5SUDE'
-                    }
+                    params=open_params
                 )
+                record_order("open_short", 'sell', TRADE_CONFIG['amount'], params=open_params, response=response_open, note="开空仓")
 
-        print("订单执行成功")
+        log_event("订单执行成功")
         time.sleep(2)
         position = get_current_position()
-        print(f"更新后持仓: {position}")
+        log_event(f"更新后持仓: {position}")
+        update_account_snapshot(position_snapshot=position)
         return position
 
     except Exception as e:
-        print(f"订单执行失败: {e}")
+        log_event(f"订单执行失败: {e}", level="ERROR")
         import traceback
         traceback.print_exc()
         sync_monitor(price_data=price_data, signal_data=signal_data, position_snapshot=current_position, error=e)
@@ -682,11 +837,11 @@ def analyze_with_deepseek_with_retry(price_data, max_retries=2):
             if signal_data and not signal_data.get('is_fallback', False):
                 return signal_data
 
-            print(f"第{attempt + 1}次尝试失败，进行重试...")
+            log_event(f"第{attempt + 1}次尝试失败，进行重试...", level="WARNING")
             time.sleep(1)
 
         except Exception as e:
-            print(f"第{attempt + 1}次尝试异常: {e}")
+            log_event(f"第{attempt + 1}次尝试异常: {e}", level="ERROR")
             if attempt == max_retries - 1:
                 return create_fallback_signal(price_data)
             time.sleep(1)
@@ -696,9 +851,10 @@ def analyze_with_deepseek_with_retry(price_data, max_retries=2):
 
 def trading_bot():
     """主交易机器人函数"""
-    print("\n" + "=" * 60)
-    print(f"执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 60)
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log_event("=" * 60, level="DEBUG")
+    log_event(f"执行时间: {timestamp}")
+    log_event("=" * 60, level="DEBUG")
 
     # 1. 获取增强版K线数据
     price_data = get_btc_ohlcv_enhanced()
@@ -706,15 +862,15 @@ def trading_bot():
         sync_monitor(error="获取增强K线数据失败")
         return
 
-    print(f"BTC当前价格: ${price_data['price']:,.2f}")
-    print(f"数据周期: {TRADE_CONFIG['timeframe']}")
-    print(f"价格变化: {price_data['price_change']:+.2f}%")
+    log_event(f"BTC当前价格: ${price_data['price']:,.2f}")
+    log_event(f"数据周期: {TRADE_CONFIG['timeframe']}")
+    log_event(f"价格变化: {price_data['price_change']:+.2f}%")
 
     # 2. 使用DeepSeek分析（带重试）
     signal_data = analyze_with_deepseek_with_retry(price_data)
 
     if signal_data.get('is_fallback', False):
-        print("⚠️ 使用备用交易信号")
+        log_event("⚠️ 使用备用交易信号", level="WARNING")
 
     # 3. 执行交易
     position_snapshot = execute_trade(signal_data, price_data)
@@ -735,20 +891,20 @@ def trading_bot():
 
 def main():
     """主函数"""
-    print("BTC/USDT OKX自动交易机器人启动成功！")
-    print("融合技术指标策略 + OKX实盘接口")
+    log_event("BTC/USDT OKX自动交易机器人启动成功！")
+    log_event("融合技术指标策略 + OKX实盘接口")
 
     if TRADE_CONFIG['test_mode']:
-        print("当前为模拟模式，不会真实下单")
+        log_event("当前为模拟模式，不会真实下单", level="WARNING")
     else:
-        print("实盘交易模式，请谨慎操作！")
+        log_event("实盘交易模式，请谨慎操作！", level="WARNING")
 
-    print(f"交易周期: {TRADE_CONFIG['timeframe']}")
-    print("已启用完整技术指标分析和持仓跟踪功能")
+    log_event(f"交易周期: {TRADE_CONFIG['timeframe']}")
+    log_event("已启用完整技术指标分析和持仓跟踪功能")
 
     # 设置交易所
     if not setup_exchange():
-        print("交易所初始化失败，程序退出")
+        log_event("交易所初始化失败，程序退出", level="ERROR")
         sync_monitor(error="交易所初始化失败")
         return
 
@@ -759,15 +915,28 @@ def main():
     )
 
     # 根据时间周期设置执行频率
-    if TRADE_CONFIG['timeframe'] == '1h':
-        schedule.every().hour.at(":01").do(trading_bot)
-        print("执行频率: 每小时一次")
-    elif TRADE_CONFIG['timeframe'] == '15m':
+    timeframe = TRADE_CONFIG['timeframe']
+    if timeframe == '1m':
+        schedule.every().minute.do(trading_bot)
+        log_event("执行频率: 每1分钟一次")
+    elif timeframe == '5m':
+        schedule.every(5).minutes.do(trading_bot)
+        log_event("执行频率: 每5分钟一次")
+    elif timeframe == '15m':
         schedule.every(15).minutes.do(trading_bot)
-        print("执行频率: 每15分钟一次")
+        log_event("执行频率: 每15分钟一次")
+    elif timeframe == '30m':
+        schedule.every(30).minutes.do(trading_bot)
+        log_event("执行频率: 每30分钟一次")
+    elif timeframe == '1h':
+        schedule.every().hour.at(":01").do(trading_bot)
+        log_event("执行频率: 每1小时一次（:01）")
+    elif timeframe == '4h':
+        schedule.every(4).hours.at(":01").do(trading_bot)
+        log_event("执行频率: 每4小时一次（:01）")
     else:
         schedule.every().hour.at(":01").do(trading_bot)
-        print("执行频率: 每小时一次")
+        log_event(f"未识别周期 {timeframe}，默认每小时一次", level="WARNING")
 
     # 立即执行一次
     trading_bot()
