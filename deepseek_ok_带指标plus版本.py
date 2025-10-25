@@ -31,18 +31,54 @@ exchange = ccxt.okx({
     'password': os.getenv('OKX_PASSWORD'),  # OKX需要交易密码
 })
 
+# 配置解析工具
+def get_env_float(key, default):
+    value = os.getenv(key)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        log_event(f"环境变量 {key} 解析失败，使用默认值 {default}", level="WARNING")
+        return default
+
+
+def get_env_int(key, default):
+    value = os.getenv(key)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        log_event(f"环境变量 {key} 解析失败，使用默认值 {default}", level="WARNING")
+        return default
+
+
+def get_env_bool(key, default):
+    value = os.getenv(key)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {'1', 'true', 'yes', 'on'}:
+        return True
+    if normalized in {'0', 'false', 'no', 'off'}:
+        return False
+    log_event(f"环境变量 {key} 解析失败，使用默认值 {default}", level="WARNING")
+    return default
+
+
 # 交易参数配置 - 结合两个版本的优点
 TRADE_CONFIG = {
-    'symbol': 'BTC/USDT:USDT',  # OKX的合约符号格式
-    'amount': 0.01,  # 交易数量 (BTC)
-    'leverage': 10,  # 杠杆倍数
-    'timeframe': '15m',  # 使用15分钟K线
-    'test_mode': False,  # 测试模式
-    'data_points': 96,  # 24小时数据（96根15分钟K线）
+    'symbol': os.getenv('TRADE_SYMBOL', 'BTC/USDT:USDT'),  # OKX的合约符号格式
+    'amount': get_env_float('TRADE_AMOUNT', 0.01),  # 交易数量 (BTC)
+    'leverage': get_env_int('TRADE_LEVERAGE', 10),  # 杠杆倍数
+    'timeframe': os.getenv('TRADE_TIMEFRAME', '15m'),  # 使用15分钟K线
+    'test_mode': get_env_bool('TRADE_TEST_MODE', False),  # 测试模式
+    'data_points': get_env_int('TRADE_DATA_POINTS', 96),  # 24小时数据（96根15分钟K线）
     'analysis_periods': {
-        'short_term': 20,  # 短期均线
-        'medium_term': 50,  # 中期均线
-        'long_term': 96  # 长期趋势
+        'short_term': get_env_int('TRADE_SHORT_TERM', 20),  # 短期均线
+        'medium_term': get_env_int('TRADE_MEDIUM_TERM', 50),  # 中期均线
+        'long_term': get_env_int('TRADE_LONG_TERM', 96)  # 长期趋势
     }
 }
 
