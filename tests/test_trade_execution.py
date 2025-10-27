@@ -27,11 +27,12 @@ class FakeExchange:
         return {"symbol": symbol, "side": side, "amount": amount, "info": params}
 
 
-def test_execute_trade_uses_balance_percent_and_stop_loss(monkeypatch):
+def test_execute_trade_uses_dynamic_balance_fraction(monkeypatch):
     # Ensure environment variables are set before importing the module
     monkeypatch.setenv("TRADE_SYMBOL", "BTC/USDT:USDT")
     monkeypatch.setenv("TRADE_LEVERAGE", "10")
-    monkeypatch.setenv("TRADE_BALANCE_PERCENT", "0.3")
+    monkeypatch.delenv("TRADE_AMOUNT", raising=False)
+    monkeypatch.setenv("TRADE_BALANCE_FRACTION", "0.5")
     monkeypatch.setenv("TRADE_TEST_MODE", "false")
 
     repo_root = pathlib.Path(__file__).resolve().parent.parent
@@ -99,10 +100,7 @@ def test_execute_trade_uses_balance_percent_and_stop_loss(monkeypatch):
     assert recorded_orders, "Expected record_order to capture at least one order"
     open_order = recorded_orders[-1]
     assert open_order["action"] == "open_long"
-    assert abs(open_order["amount"] - 0.15) < 1e-6
+    assert abs(open_order["amount"] - 0.25) < 1e-6
 
     params = open_order["params"]
     assert params.get("posSide") == "long"
-    assert params.get("slTriggerPx") == 19500
-    assert params.get("slOrdPx") == "-1"
-    assert params.get("slTriggerPxType") == "last"

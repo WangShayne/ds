@@ -70,7 +70,8 @@ def get_env_bool(key, default):
 # 交易参数配置 - 结合两个版本的优点
 TRADE_CONFIG = {
     'symbol': os.getenv('TRADE_SYMBOL', 'BTC/USDT:USDT'),  # OKX的合约符号格式
-    'amount': get_env_float('TRADE_AMOUNT', 0.01),  # 交易数量 (BTC)
+    'default_amount': get_env_float('TRADE_AMOUNT', 0.0),  # 回退固定交易数量 (BTC)
+    'balance_fraction': max(0.0, min(get_env_float('TRADE_BALANCE_FRACTION', 0.25), 1.0)),  # 使用余额百分比动态下单
     'leverage': get_env_int('TRADE_LEVERAGE', 10),  # 杠杆倍数
     'timeframe': os.getenv('TRADE_TIMEFRAME', '15m'),  # 使用15分钟K线
     'test_mode': get_env_bool('TRADE_TEST_MODE', False),  # 测试模式
@@ -214,6 +215,52 @@ def update_account_snapshot(balance=None, usdt_balance=None, position_snapshot=N
         snapshot['entry_price'] = position_snapshot.get('entry_price')
 
     account_snapshot.update({k: v for k, v in snapshot.items() if v is not None})
+
+
+def calculate_trade_amount(usdt_balance, price):
+    """根据账户余额与价格动态计算下单数量与所需保证金。"""
+    leverage = max(TRADE_CONFIG.get('leverage', 1), 1)
+    default_amount = TRADE_CONFIG.get('default_amount', 0.0)
+    fraction = TRADE_CONFIG.get('balance_fraction', 0.25) or 0.0
+
+    try:
+        price_value = float(price)
+    except (TypeError, ValueError):
+        price_value = None
+
+    try:
+        balance_value = float(usdt_balance)
+    except (TypeError, ValueError):
+        balance_value = None
+
+    if price_value is None or price_value <= 0 or balance_value is None:
+        # 回退到固定仓位
+        fallback_margin = max(default_amount, 0.0) * price_value / leverage if price_value else 0.0
+        return max(default_amount, 0.0), fallback_margin
+
+    # 动态仓位
+    target_margin = balance_value * fraction
+    if target_margin <= 0:
+        # 若比例为0，则使用固定仓位
+        fallback_margin = max(default_amount, 0.0) * price_value / leverage
+        return max(default_amount, 0.0), fallback_margin
+
+    raw_amount = (target_margin * leverage) / price_value
+    if raw_amount <= 0:
+        fallback_margin = max(default_amount, 0.0) * price_value / leverage
+        return max(default_amount, 0.0), fallback_margin
+
+    try:
+        precise_amount = float(exchange.amount_to_precision(TRADE_CONFIG['symbol'], raw_amount))
+    except Exception:
+        precise_amount = raw_amount
+
+    if precise_amount <= 0 and default_amount > 0:
+        fallback_margin = max(default_amount, 0.0) * price_value / leverage
+        return max(default_amount, 0.0), fallback_margin
+
+    required_margin = (precise_amount * price_value) / leverage
+    return precise_amount, required_margin
 
 
 def sync_monitor(price_data=None, signal_data=None, position_snapshot=None, error=None, extra_metrics=None):
@@ -699,55 +746,59 @@ def execute_trade(signal_data, price_data):
         return current_position
 
     try:
-        # 获取账户余额
+        # 获取账户余额并同步监控
         balance = exchange.fetch_balance()
         usdt_balance = balance['USDT']['free']
         update_account_snapshot(balance=balance, usdt_balance=usdt_balance, position_snapshot=current_position)
+        try:
+            usdt_balance_value = float(usdt_balance)
+        except (TypeError, ValueError):
+            usdt_balance_value = None
 
-        # 智能保证金检查
-        required_margin = 0
+        # 动态计算下单数量
+        trade_amount, required_margin = calculate_trade_amount(usdt_balance, price_data['price'])
+        if trade_amount <= 0:
+            log_event("⚠️ 计算得到的下单数量为0，跳过交易", level="WARNING")
+            return current_position
+
+        if usdt_balance_value is not None and required_margin > usdt_balance_value:
+            log_event(
+                f"⚠️ 动态保证金 {required_margin:.2f} USDT 超过可用余额 {usdt_balance_value:.2f} USDT，将按可用余额调整仓位",
+                level="WARNING",
+            )
+            trade_amount, required_margin = calculate_trade_amount(usdt_balance_value, price_data['price'])
+            if trade_amount <= 0:
+                log_event("⚠️ 调整后下单数量仍为0，跳过交易", level="WARNING")
+                return current_position
+
+        operation_type = "保持仓位"
 
         if signal_data['signal'] == 'BUY':
             if current_position and current_position['side'] == 'short':
-                # 平空仓 + 开多仓：需要额外保证金
-                required_margin = price_data['price'] * TRADE_CONFIG['amount'] / TRADE_CONFIG['leverage']
                 operation_type = "平空开多"
             elif not current_position:
-                # 开多仓：需要保证金
-                required_margin = price_data['price'] * TRADE_CONFIG['amount'] / TRADE_CONFIG['leverage']
                 operation_type = "开多仓"
             else:
-                # 已持有多仓：不需要额外保证金
-                required_margin = 0
                 operation_type = "保持多仓"
+                required_margin = 0
 
         elif signal_data['signal'] == 'SELL':
             if current_position and current_position['side'] == 'long':
-                # 平多仓 + 开空仓：需要额外保证金
-                required_margin = price_data['price'] * TRADE_CONFIG['amount'] / TRADE_CONFIG['leverage']
                 operation_type = "平多开空"
             elif not current_position:
-                # 开空仓：需要保证金
-                required_margin = price_data['price'] * TRADE_CONFIG['amount'] / TRADE_CONFIG['leverage']
                 operation_type = "开空仓"
             else:
-                # 已持有空仓：不需要额外保证金
-                required_margin = 0
                 operation_type = "保持空仓"
+                required_margin = 0
 
         elif signal_data['signal'] == 'HOLD':
             log_event("建议观望，不执行交易", level="INFO")
             return current_position
 
-        log_event(f"操作类型: {operation_type}, 需要保证金: {required_margin:.2f} USDT", level="DEBUG")
-
-        # 只有在需要额外保证金时才检查
-        if required_margin > 0:
-            if required_margin > usdt_balance * 0.8:
-                log_event(f"⚠️ 保证金不足，跳过交易。需要: {required_margin:.2f} USDT, 可用: {usdt_balance:.2f} USDT", level="WARNING")
-                return current_position
-        else:
-            log_event("✅ 无需额外保证金，继续执行", level="INFO")
+        log_event(
+            f"操作类型: {operation_type}, 计划仓位: {trade_amount:.6f} BTC, 预计保证金: {required_margin:.2f} USDT",
+            level="DEBUG",
+        )
 
         # 执行交易逻辑   tag 是我的经纪商api（不拿白不拿），不会影响大家返佣，介意可以删除
         if signal_data['signal'] == 'BUY':
@@ -777,10 +828,10 @@ def execute_trade(signal_data, price_data):
                 response_open = exchange.create_market_order(
                     TRADE_CONFIG['symbol'],
                     'buy',
-                    TRADE_CONFIG['amount'],
+                    trade_amount,
                     params=open_params
                 )
-                record_order("open_long", 'buy', TRADE_CONFIG['amount'], params=open_params, response=response_open, note="开多仓")
+                record_order("open_long", 'buy', trade_amount, params=open_params, response=response_open, note="开多仓")
             elif current_position and current_position['side'] == 'long':
                 log_event("已有多头持仓，保持现状", level="INFO")
             else:
@@ -794,10 +845,10 @@ def execute_trade(signal_data, price_data):
                 response_open = exchange.create_market_order(
                     TRADE_CONFIG['symbol'],
                     'buy',
-                    TRADE_CONFIG['amount'],
+                    trade_amount,
                     params=open_params
                 )
-                record_order("open_long", 'buy', TRADE_CONFIG['amount'], params=open_params, response=response_open, note="开多仓")
+                record_order("open_long", 'buy', trade_amount, params=open_params, response=response_open, note="开多仓")
 
         elif signal_data['signal'] == 'SELL':
             if current_position and current_position['side'] == 'long':
@@ -826,10 +877,10 @@ def execute_trade(signal_data, price_data):
                 response_open = exchange.create_market_order(
                     TRADE_CONFIG['symbol'],
                     'sell',
-                    TRADE_CONFIG['amount'],
+                    trade_amount,
                     params=open_params
                 )
-                record_order("open_short", 'sell', TRADE_CONFIG['amount'], params=open_params, response=response_open, note="开空仓")
+                record_order("open_short", 'sell', trade_amount, params=open_params, response=response_open, note="开空仓")
             elif current_position and current_position['side'] == 'short':
                 log_event("已有空头持仓，保持现状", level="INFO")
             else:
@@ -843,10 +894,10 @@ def execute_trade(signal_data, price_data):
                 response_open = exchange.create_market_order(
                     TRADE_CONFIG['symbol'],
                     'sell',
-                    TRADE_CONFIG['amount'],
+                    trade_amount,
                     params=open_params
                 )
-                record_order("open_short", 'sell', TRADE_CONFIG['amount'], params=open_params, response=response_open, note="开空仓")
+                record_order("open_short", 'sell', trade_amount, params=open_params, response=response_open, note="开空仓")
 
         log_event("订单执行成功")
         time.sleep(2)
