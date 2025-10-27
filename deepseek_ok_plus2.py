@@ -3,10 +3,11 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timedelta
+from collections import deque
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Deque, Dict, Optional
 
 import ccxt
 import pandas as pd
@@ -19,6 +20,44 @@ from monitoring.state import update_bot_state
 load_dotenv()
 
 BOT_NAME = Path(__file__).stem
+
+runtime_log: Deque[Dict[str, Any]] = deque(maxlen=100)
+deepseek_log: Deque[Dict[str, Any]] = deque(maxlen=20)
+
+
+class MonitorLogHandler(logging.Handler):
+    """Capture log records in memory for the monitoring dashboard."""
+
+    def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover - lightweight handler
+        try:
+            timestamp = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
+            entry = {
+                'timestamp': timestamp,
+                'level': record.levelname,
+                'message': record.getMessage(),
+            }
+            runtime_log.append(entry)
+        except Exception:
+            # 监控日志失败不影响主流程
+            pass
+
+
+def record_deepseek_message(prompt_text: Optional[str], response_text: Optional[str], status: str = "INFO") -> None:
+    """Persist DeepSeek request/response snippets for monitoring."""
+
+    def _trim(value: Optional[str], limit: int = 700) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value)
+        return text if len(text) <= limit else text[:limit] + "..."
+
+    entry = {
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'status': (status or "INFO").upper(),
+        'prompt': _trim(prompt_text),
+        'response': _trim(response_text),
+    }
+    deepseek_log.append(entry)
 
 
 def configure_logging() -> logging.Logger:
@@ -51,6 +90,10 @@ def configure_logging() -> logging.Logger:
         )
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
+
+        monitor_handler = MonitorLogHandler()
+        monitor_handler.setLevel(logging.DEBUG)
+        logger.addHandler(monitor_handler)
 
     return logger
 
@@ -102,17 +145,17 @@ ORDER_TAG = os.getenv("OKX_ORDER_TAG", "60bb4a8d3416BCDE")
 def setup_exchange():
     """设置交易所参数 - 强制全仓模式"""
     try:
-        logger.info("Loading OKX market metadata for %s", TRADE_CONFIG['symbol'])
+        logger.info("加载 OKX 合约 %s 的市场元数据", TRADE_CONFIG['symbol'])
         markets = exchange.load_markets()
         btc_market = markets[TRADE_CONFIG['symbol']]
 
         contract_size = float(btc_market['contractSize'])
         TRADE_CONFIG['contract_size'] = contract_size
         TRADE_CONFIG['min_amount'] = btc_market['limits']['amount']['min']
-        logger.info("Contract spec: 1 contract = %.6f BTC", contract_size)
-        logger.info("Minimum order size: %s contracts", TRADE_CONFIG['min_amount'])
+        logger.info("合约规格：1 张 = %.6f BTC", contract_size)
+        logger.info("最小下单数量：%s 张", TRADE_CONFIG['min_amount'])
 
-        logger.info("Checking for existing isolated positions")
+        logger.info("检查是否存在逐仓持仓")
         positions = exchange.fetch_positions([TRADE_CONFIG['symbol']])
 
         for pos in positions:
@@ -123,20 +166,20 @@ def setup_exchange():
             mode = pos.get('mgnMode')
             if contracts > 0 and mode == 'isolated':
                 logger.error(
-                    "Detected isolated position %s with %s contracts at %s; aborting",
+                    "检测到逐仓持仓 %s，数量 %s 张，开仓价 %s，终止启动",
                     pos.get('side'),
                     contracts,
                     pos.get('entryPrice'),
                 )
                 return False
 
-        logger.info("Ensuring single-side position mode")
+        logger.info("尝试设置单向持仓模式")
         try:
             exchange.set_position_mode(False, TRADE_CONFIG['symbol'])
         except Exception as exc:  # noqa: BLE001 - log and continue
-            logger.warning("Failed to set single-side mode (likely already set): %s", exc)
+            logger.warning("单向持仓模式设置失败（可能已设置）：%s", exc)
 
-        logger.info("Setting cross margin leverage to %sx", TRADE_CONFIG['leverage'])
+        logger.info("设置全仓杠杆为 %sx", TRADE_CONFIG['leverage'])
         exchange.set_leverage(
             TRADE_CONFIG['leverage'],
             TRADE_CONFIG['symbol'],
@@ -145,23 +188,23 @@ def setup_exchange():
 
         balance = exchange.fetch_balance()
         usdt_balance = float(balance['USDT']['free'])
-        logger.info("Available USDT balance: %.2f", usdt_balance)
+        logger.info("可用 USDT 余额：%.2f", usdt_balance)
 
         current_pos = get_current_position()
         if current_pos:
             logger.info(
-                "Current position detected: %s %.2f contracts",
+                "当前持仓：方向 %s，数量 %.2f 张",
                 current_pos['side'],
                 current_pos['size'],
             )
         else:
-            logger.info("No open positions detected")
+            logger.info("当前无持仓")
 
-        logger.info("Exchange configuration completed (cross margin + single side)")
+        logger.info("交易所配置完成（全仓 + 单向持仓）")
         return True
 
     except Exception as exc:  # noqa: BLE001 - need full trace for exchange setup
-        logger.exception("Exchange setup failed: %s", exc)
+        logger.exception("交易所初始化失败：%s", exc)
         return False
 
 
@@ -212,16 +255,16 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
         min_contracts = TRADE_CONFIG.get('min_amount', 0.01)
         if contract_size < min_contracts:
             contract_size = min_contracts
-            logger.warning("Position size below minimum, adjusting to %.2f contracts", contract_size)
+            logger.warning("仓位小于最小下单量，调整为 %.2f 张", contract_size)
 
         logger.info(
-            "Position sizing completed: balance %.2f USDT, final %.2f USDT, contracts %.2f",
+            "仓位计算完成：余额 %.2f USDT，最终使用 %.2f USDT，对应 %.2f 张",
             usdt_balance,
             final_usdt,
             contract_size,
         )
         logger.debug(
-            "Sizing breakdown | base %.2f | confidence %.2f | trend %.2f | rsi %.2f | suggested %.2f | max %.2f",
+            "仓位明细 | 基础 %.2f | 置信 %.2f | 趋势 %.2f | RSI %.2f | 建议 %.2f | 上限 %.2f",
             base_usdt,
             confidence_multiplier,
             trend_multiplier,
@@ -233,13 +276,13 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
         return contract_size
 
     except Exception as e:
-        logger.exception("Failed to calculate intelligent position size: %s", e)
+        logger.exception("仓位智能计算失败：%s", e)
         base_usdt = float(config['base_usdt_amount'])
         contract_size = (base_usdt * TRADE_CONFIG['leverage']) / (
             price_data['price'] * TRADE_CONFIG.get('contract_size', 0.01)
         )
         fallback_size = round(max(contract_size, TRADE_CONFIG.get('min_amount', 0.01)), 2)
-        logger.info("Using fallback contract size %.2f", fallback_size)
+        logger.info("使用备用仓位：%.2f 张", fallback_size)
         return fallback_size
 
 
@@ -285,7 +328,7 @@ def calculate_technical_indicators(df):
 
         return df
     except Exception as e:
-        logger.exception("Failed to compute technical indicators: %s", e)
+        logger.exception("技术指标计算异常：%s", e)
         return df
 
 
@@ -312,7 +355,7 @@ def get_support_resistance_levels(df, lookback=20):
             'price_vs_support': ((current_price - support_level) / support_level) * 100
         }
     except Exception as e:
-        logger.exception("Failed to calculate support/resistance levels: %s", e)
+        logger.exception("支撑阻力计算异常：%s", e)
         return {}
 
 
@@ -373,7 +416,7 @@ def get_sentiment_indicators():
                             period['startTime'], '%Y-%m-%d %H:%M:%S')).total_seconds() // 60)
 
                         logger.info(
-                            "Using sentiment data at %s (delay %s minutes)",
+                            "使用情绪数据时间 %s（延迟 %s 分钟）",
                             period['startTime'],
                             data_delay,
                         )
@@ -386,12 +429,12 @@ def get_sentiment_indicators():
                             'data_delay_minutes': data_delay
                         }
 
-                logger.warning("Sentiment API returned empty data for all periods")
+                logger.warning("情绪接口返回空数据")
                 return None
 
         return None
     except Exception as e:
-        logger.exception("Failed to retrieve sentiment indicators: %s", e)
+        logger.exception("获取情绪指标失败：%s", e)
         return None
 
 
@@ -423,7 +466,7 @@ def get_market_trend(df):
             'rsi_level': df['rsi'].iloc[-1]
         }
     except Exception as e:
-        logger.exception("Failed to evaluate market trend: %s", e)
+        logger.exception("趋势分析失败：%s", e)
         return {}
 
 
@@ -474,7 +517,7 @@ def get_btc_ohlcv_enhanced():
             'full_data': df
         }
     except Exception as e:
-        logger.exception("Failed to fetch enhanced OHLCV data: %s", e)
+        logger.exception("抓取增强行情数据失败：%s", e)
         return None
 
 
@@ -540,7 +583,7 @@ def get_current_position():
         return None
 
     except Exception as e:
-        logger.exception("Failed to fetch positions: %s", e)
+        logger.exception("查询持仓失败：%s", e)
         return None
 
 
@@ -557,8 +600,8 @@ def safe_json_parse(json_str):
             json_str = re.sub(r',\s*]', ']', json_str)
             return json.loads(json_str)
         except json.JSONDecodeError as e:
-            logger.warning("Failed to parse JSON response: %s", e, exc_info=False)
-            logger.debug("Original JSON payload: %s", json_str)
+            logger.warning("解析 JSON 响应失败：%s", e, exc_info=False)
+            logger.debug("原始 JSON 内容：%s", json_str)
             return None
 
 
@@ -707,7 +750,7 @@ def analyze_with_deepseek(price_data):
 
         # 安全解析JSON
         result = response.choices[0].message.content
-        logger.debug("DeepSeek raw response: %s", result)
+        logger.debug("DeepSeek 原始回答：%s", result)
 
         # 提取JSON部分
         start_idx = result.find('{')
@@ -737,7 +780,7 @@ def analyze_with_deepseek(price_data):
         signal_count = len([s for s in signal_history if s.get('signal') == signal_data['signal']])
         total_signals = len(signal_history)
         logger.debug(
-            "Signal stats: %s occurred %s/%s times",
+            "信号统计：%s 在最近 %s/%s 次出现",
             signal_data['signal'],
             signal_count,
             total_signals,
@@ -747,12 +790,16 @@ def analyze_with_deepseek(price_data):
         if len(signal_history) >= 3:
             last_three = [s['signal'] for s in signal_history[-3:]]
             if len(set(last_three)) == 1:
-                logger.warning("Signal %s repeated three times consecutively", signal_data['signal'])
+                logger.warning("警告：信号 %s 连续出现 3 次", signal_data['signal'])
+
+        status = "SUCCESS" if not signal_data.get('is_fallback') else "WARN"
+        record_deepseek_message(prompt, result, status=status)
 
         return signal_data
 
     except Exception as e:
-        logger.exception("DeepSeek analysis failed: %s", e)
+        logger.exception("DeepSeek 分析失败：%s", e)
+        record_deepseek_message(prompt, str(e), status="ERROR")
         return create_fallback_signal(price_data)
 
 
@@ -761,26 +808,26 @@ def execute_intelligent_trade(signal_data, price_data):
     current_position = get_current_position()
 
     logger.info(
-        "Signal %s (confidence %s) | reason: %s",
+        "收到信号 %s（置信度 %s），理由：%s",
         signal_data.get('signal'),
         signal_data.get('confidence'),
         signal_data.get('reason'),
     )
-    logger.debug("Current position snapshot: %s", current_position)
+    logger.debug("当前持仓快照：%s", current_position)
 
     if signal_data.get('signal') == 'HOLD':
-        logger.info("HOLD signal received; skip order placement")
+        logger.info("收到 HOLD 信号，跳过下单")
         return current_position
 
     position_size = calculate_intelligent_position(signal_data, price_data, current_position)
 
     if signal_data.get('confidence') == 'LOW' and not TRADE_CONFIG['test_mode']:
-        logger.info("Skipping low-confidence signal in live mode")
+        logger.info("实盘模式下跳过低置信度信号")
         return current_position
 
     if TRADE_CONFIG['test_mode']:
         logger.info(
-            "Test mode active; simulated %s order of %.2f contracts",
+            "测试模式：模拟执行 %s 信号，仓位 %.2f 张",
             signal_data.get('signal'),
             position_size,
         )
@@ -794,7 +841,7 @@ def execute_intelligent_trade(signal_data, price_data):
             if current_position and current_position['side'] == 'short':
                 if current_position['size'] > 0:
                     logger.info(
-                        "Closing short %.2f contracts before opening long",
+                        "先平空 %.2f 张，再开多",
                         current_position['size'],
                     )
                     exchange.create_market_order(
@@ -805,9 +852,9 @@ def execute_intelligent_trade(signal_data, price_data):
                     )
                     time.sleep(1)
                 else:
-                    logger.warning("Detected short position with zero size; skipping reduce step")
+                    logger.warning("检测到空头持仓数量为 0，跳过平仓步骤")
 
-                logger.info("Opening long position of %.2f contracts", position_size)
+                logger.info("开多 %.2f 张", position_size)
                 exchange.create_market_order(
                     symbol,
                     'buy',
@@ -820,7 +867,7 @@ def execute_intelligent_trade(signal_data, price_data):
                 if abs(size_diff) >= 0.01:
                     if size_diff > 0:
                         logger.info(
-                            "Scaling in long position by %.2f contracts (current %.2f)",
+                            "多头加仓 %.2f 张（当前 %.2f 张）",
                             size_diff,
                             current_position['size'],
                         )
@@ -833,7 +880,7 @@ def execute_intelligent_trade(signal_data, price_data):
                     else:
                         reduce_size = abs(size_diff)
                         logger.info(
-                            "Scaling out long position by %.2f contracts (current %.2f)",
+                            "多头减仓 %.2f 张（当前 %.2f 张）",
                             reduce_size,
                             current_position['size'],
                         )
@@ -845,12 +892,12 @@ def execute_intelligent_trade(signal_data, price_data):
                         )
                 else:
                     logger.info(
-                        "Existing long position aligned with target (current %.2f, target %.2f)",
+                        "当前多头仓位与目标一致（现有 %.2f 张，目标 %.2f 张）",
                         current_position['size'],
                         position_size,
                     )
             else:
-                logger.info("Opening new long position of %.2f contracts", position_size)
+                logger.info("新开多头 %.2f 张", position_size)
                 exchange.create_market_order(
                     symbol,
                     'buy',
@@ -862,7 +909,7 @@ def execute_intelligent_trade(signal_data, price_data):
             if current_position and current_position['side'] == 'long':
                 if current_position['size'] > 0:
                     logger.info(
-                        "Closing long %.2f contracts before opening short",
+                        "先平多 %.2f 张，再开空",
                         current_position['size'],
                     )
                     exchange.create_market_order(
@@ -873,9 +920,9 @@ def execute_intelligent_trade(signal_data, price_data):
                     )
                     time.sleep(1)
                 else:
-                    logger.warning("Detected long position with zero size; skipping reduce step")
+                    logger.warning("检测到多头持仓数量为 0，跳过平仓步骤")
 
-                logger.info("Opening short position of %.2f contracts", position_size)
+                logger.info("开空 %.2f 张", position_size)
                 exchange.create_market_order(
                     symbol,
                     'sell',
@@ -888,7 +935,7 @@ def execute_intelligent_trade(signal_data, price_data):
                 if abs(size_diff) >= 0.01:
                     if size_diff > 0:
                         logger.info(
-                            "Scaling in short position by %.2f contracts (current %.2f)",
+                            "空头加仓 %.2f 张（当前 %.2f 张）",
                             size_diff,
                             current_position['size'],
                         )
@@ -901,7 +948,7 @@ def execute_intelligent_trade(signal_data, price_data):
                     else:
                         reduce_size = abs(size_diff)
                         logger.info(
-                            "Scaling out short position by %.2f contracts (current %.2f)",
+                            "空头减仓 %.2f 张（当前 %.2f 张）",
                             reduce_size,
                             current_position['size'],
                         )
@@ -913,12 +960,12 @@ def execute_intelligent_trade(signal_data, price_data):
                         )
                 else:
                     logger.info(
-                        "Existing short position aligned with target (current %.2f, target %.2f)",
+                        "当前空头仓位与目标一致（现有 %.2f 张，目标 %.2f 张）",
                         current_position['size'],
                         position_size,
                     )
             else:
-                logger.info("Opening new short position of %.2f contracts", position_size)
+                logger.info("新开空头 %.2f 张", position_size)
                 exchange.create_market_order(
                     symbol,
                     'sell',
@@ -926,17 +973,17 @@ def execute_intelligent_trade(signal_data, price_data):
                     params={'tag': ORDER_TAG}
                 )
 
-        logger.info("Trade execution complete for signal %s", target_side)
+        logger.info("信号 %s 执行完成", target_side)
         time.sleep(2)
         updated_position = get_current_position()
-        logger.info("Updated position snapshot: %s", updated_position)
+        logger.info("更新后的持仓：%s", updated_position)
         return updated_position
 
     except Exception as exc:  # noqa: BLE001 - need stack for exchange failures
-        logger.exception("Trade execution failed: %s", exc)
+        logger.exception("交易执行失败：%s", exc)
 
         if "don't have any positions" in str(exc).lower():
-            logger.info("Attempting direct position open after position-not-found error")
+            logger.info("因未找到持仓，尝试直接开仓")
             try:
                 order_side = 'buy' if signal_data.get('signal') == 'BUY' else 'sell'
                 exchange.create_market_order(
@@ -945,9 +992,9 @@ def execute_intelligent_trade(signal_data, price_data):
                     position_size,
                     params={'tag': ORDER_TAG}
                 )
-                logger.info("Fallback order placement succeeded")
+                logger.info("备用下单成功")
             except Exception as nested_exc:  # noqa: BLE001
-                logger.exception("Fallback order placement failed: %s", nested_exc)
+                logger.exception("备用下单失败：%s", nested_exc)
 
     return current_position
 
@@ -960,11 +1007,11 @@ def analyze_with_deepseek_with_retry(price_data, max_retries=2):
             if signal_data and not signal_data.get('is_fallback', False):
                 return signal_data
 
-            logger.warning("DeepSeek attempt %s returned fallback signal; retrying", attempt + 1)
+            logger.warning("第 %s 次 DeepSeek 调用返回备用信号，准备重试", attempt + 1)
             time.sleep(1)
 
         except Exception as e:
-            logger.exception("DeepSeek attempt %s failed: %s", attempt + 1, e)
+            logger.exception("第 %s 次 DeepSeek 调用异常：%s", attempt + 1, e)
             if attempt == max_retries - 1:
                 return create_fallback_signal(price_data)
             time.sleep(1)
@@ -1003,16 +1050,21 @@ def publish_monitoring_snapshot(
             'trade_config': TRADE_CONFIG,
             'metadata': {
                 'bot_name': BOT_NAME,
-                'mode': 'test' if TRADE_CONFIG['test_mode'] else 'live',
+                'mode': '测试' if TRADE_CONFIG['test_mode'] else '实盘',
+                'log_entries': len(runtime_log),
+                'deepseek_entries': len(deepseek_log),
             },
         }
+
+        payload['logs'] = list(runtime_log)
+        payload['deepseek_messages'] = list(deepseek_log)
 
         if error:
             payload['error'] = error
 
         update_bot_state(BOT_NAME, **payload)
     except Exception as exc:  # noqa: BLE001 - monitoring must not break trading
-        logger.exception("Failed to publish monitoring snapshot: %s", exc)
+        logger.exception("监控快照写入失败：%s", exc)
 
 
 def wait_for_next_period():
@@ -1039,9 +1091,9 @@ def wait_for_next_period():
     display_seconds = 60 - current_second if current_second > 0 else 0
 
     if display_minutes > 0:
-        logger.info("Waiting %s minutes %s seconds for next interval", display_minutes, display_seconds)
+        logger.info("等待 %s 分 %s 秒进入下一周期", display_minutes, display_seconds)
     else:
-        logger.info("Waiting %s seconds for next interval", display_seconds)
+        logger.info("等待 %s 秒进入下一周期", display_seconds)
 
     return seconds_to_wait
 
@@ -1051,16 +1103,16 @@ def trading_bot():
     if wait_seconds > 0:
         time.sleep(wait_seconds)
 
-    logger.info("Starting trading cycle at %s", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    logger.info("开始新的交易周期：%s", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
     price_data = get_btc_ohlcv_enhanced()
     if not price_data:
-        logger.warning("Price data unavailable; skipping cycle")
-        publish_monitoring_snapshot(None, None, get_current_position(), "price data unavailable")
+        logger.warning("行情数据不可用，跳过本周期")
+        publish_monitoring_snapshot(None, None, get_current_position(), "行情数据不可用")
         return
 
     logger.info(
-        "Market snapshot | price %.2f | timeframe %s | change %.2f%%",
+        "行情概览 | 价格 %.2f | 周期 %s | 涨跌 %.2f%%",
         price_data['price'],
         TRADE_CONFIG['timeframe'],
         price_data['price_change'],
@@ -1069,28 +1121,29 @@ def trading_bot():
     signal_data = analyze_with_deepseek_with_retry(price_data)
 
     if signal_data.get('is_fallback', False):
-        logger.warning("Using fallback trading signal due to analysis issues")
+        logger.warning("因分析异常使用备用交易信号")
 
     try:
         latest_position = execute_intelligent_trade(signal_data, price_data)
         publish_monitoring_snapshot(price_data, signal_data, latest_position)
     except Exception as exc:  # noqa: BLE001 - ensure monitoring is updated on failure
-        logger.exception("Unexpected error during trade execution: %s", exc)
+        logger.exception("执行交易时出现意外错误：%s", exc)
         publish_monitoring_snapshot(price_data, signal_data, get_current_position(), str(exc))
 
 
 def main():
     """主函数"""
-    logger.info("Starting OKX BTC/USDT trading bot")
-    logger.info("Operating mode: %s", "test" if TRADE_CONFIG['test_mode'] else "live")
-    logger.info("Timeframe: %s", TRADE_CONFIG['timeframe'])
+    logger.info("OKX BTC/USDT 交易机器人启动")
+    mode_text = "测试" if TRADE_CONFIG['test_mode'] else "实盘"
+    logger.info("运行模式：%s", mode_text)
+    logger.info("交易周期：%s", TRADE_CONFIG['timeframe'])
 
     if not setup_exchange():
-        logger.error("Exchange initialisation failed; aborting bot startup")
-        publish_monitoring_snapshot(None, None, get_current_position(), "exchange setup failed")
+        logger.error("交易所初始化失败，机器人停止启动")
+        publish_monitoring_snapshot(None, None, get_current_position(), "交易所初始化失败")
         return
 
-    logger.info("Execution cadence: every 15 minutes on the clock")
+    logger.info("执行频率：每 15 分钟整点运行")
 
     while True:
         trading_bot()
