@@ -134,7 +134,7 @@ TRADE_CONFIG = {
         'high_confidence_multiplier': 1.5,
         'medium_confidence_multiplier': 1.0,
         'low_confidence_multiplier': 0.5,
-        'max_position_ratio': 0.30,  # 单次最大仓位比例（30%可用余额）
+        'max_position_ratio': 10,  # 单次最大仓位比例（None 表示按可用余额上限）
         'trend_strength_multiplier': 1.2
     }
 }
@@ -241,9 +241,13 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
 
         suggested_usdt = base_usdt * confidence_multiplier * trend_multiplier * rsi_multiplier
 
-        max_ratio = max(0.0, min(float(config.get('max_position_ratio', 0.30)), 1.0))
-        max_usdt = usdt_balance * max_ratio
-        final_usdt = max(0.0, min(suggested_usdt, max_usdt, usdt_balance))
+        cap_candidates = [suggested_usdt, usdt_balance]
+        raw_ratio = config.get('max_position_ratio')
+        if raw_ratio is not None:
+            max_ratio = max(0.0, min(float(raw_ratio), 1.0))
+            cap_candidates.append(usdt_balance * max_ratio)
+
+        final_usdt = max(0.0, min(cap_candidates))
 
         contract_denom = price_data['price'] * TRADE_CONFIG['contract_size']
         if contract_denom <= 0:
