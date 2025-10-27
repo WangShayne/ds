@@ -6,6 +6,8 @@ x-bot-base: &bot-base
     - .env
   volumes:
     - ./logs:/app/logs
+  environment:
+    BOT_LOG_LEVEL: ${BOT_LOG_LEVEL:-INFO}
   restart: unless-stopped
 
 services:
@@ -30,5 +32,11 @@ services:
   okx_plus_bot:
     <<: *bot-base
     command: ["python", "deepseek_ok_带指标plus版本.py"]
+    depends_on:
+      - monitoring
+
+  okx_plus2_bot:
+    <<: *bot-base
+    command: ["python", "deepseek_ok_plus2.py"]
     depends_on:
       - monitoring

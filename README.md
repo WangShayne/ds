@@ -67,6 +67,12 @@
 - 可通过环境变量自定义行为：`MONITOR_HOST`、`MONITOR_PORT`、`MONITOR_REFRESH_SECONDS`、`MONITOR_STATUS_FILE`。
 - 监控面板展示最近信号列表、最新行情与各版本策略的运行状态，可结合 `pm2 logs` 快速排查异常。
 
+### 日志监控
+
+- `deepseek_ok_plus2.py` 已启用标准 `logging`，默认在 `logs/deepseek_ok_plus2.log` 生成滚动日志，并同步输出到控制台。
+- 通过环境变量 `BOT_LOG_LEVEL`（默认为 `INFO`）调整日志级别，Docker Compose 会自动将该变量传入容器。
+- 策略内置 25% 可用余额的单笔仓位上限，配合日志可快速追踪仓位调整原因。
+
 ### Docker Compose 部署
 
 - 使用 `docker compose` 进行容器化部署，请参考 `docs/DEPLOYMENT.md`。

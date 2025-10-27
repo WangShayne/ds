@@ -13,6 +13,7 @@
 ├── Dockerfile
 ├── docker-compose.yml
 ├── deepseek.py
+├── deepseek_ok_plus2.py
 ├── deepseek_ok版本.py
 ├── deepseek_ok_带指标plus版本.py
 ├── monitoring/
@@ -47,6 +48,9 @@ docker compose up okx_bot
 
 # 运行 OKX 指标增强策略
 docker compose up okx_plus_bot
+
+# 运行 OKX Plus2 策略（含日志与风险管理优化）
+docker compose up okx_plus2_bot
 ```
 
 多个服务可以一起启动，例如：
@@ -66,6 +70,8 @@ docker compose up -d monitoring binance_bot
 - 所有服务默认加载根目录 `.env`。
 - 如果需要针对某个策略修改行为，可在 `docker-compose.yml` 中为对应服务追加 `environment` 覆盖。
 - 日志目录绑定到宿主机 `./logs`，便于调试及备份。
+- 新增的 `okx_plus2_bot` 通过环境变量 `BOT_LOG_LEVEL` 控制日志级别，默认值为 `INFO`；日志文件保存在容器内 `/app/logs/deepseek_ok_plus2.log`。
+- 策略内置单笔仓位 25% 可用余额上限，可通过日志与监控面板核对仓位变化。
 
 ## 升级流程
 1. 更新仓库代码与依赖：
