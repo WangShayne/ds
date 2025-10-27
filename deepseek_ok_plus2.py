@@ -243,9 +243,11 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
 
         cap_candidates = [suggested_usdt, usdt_balance]
         raw_ratio = config.get('max_position_ratio')
+        max_usdt = None
         if raw_ratio is not None:
             max_ratio = max(0.0, min(float(raw_ratio), 1.0))
-            cap_candidates.append(usdt_balance * max_ratio)
+            max_usdt = usdt_balance * max_ratio
+            cap_candidates.append(max_usdt)
 
         final_usdt = max(0.0, min(cap_candidates))
 
@@ -268,13 +270,13 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
             contract_size,
         )
         logger.debug(
-            "仓位明细 | 基础 %.2f | 置信 %.2f | 趋势 %.2f | RSI %.2f | 建议 %.2f | 上限 %.2f",
+            "仓位明细 | 基础 %.2f | 置信 %.2f | 趋势 %.2f | RSI %.2f | 建议 %.2f | 上限 %s",
             base_usdt,
             confidence_multiplier,
             trend_multiplier,
             rsi_multiplier,
             suggested_usdt,
-            max_usdt,
+            f"{max_usdt:.2f}" if max_usdt is not None else "不限制",
         )
 
         return contract_size
