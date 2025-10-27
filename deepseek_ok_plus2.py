@@ -134,7 +134,7 @@ TRADE_CONFIG = {
         'high_confidence_multiplier': 1.5,
         'medium_confidence_multiplier': 1.0,
         'low_confidence_multiplier': 0.5,
-        'max_position_ratio': 0.25,  # 单次最大仓位比例（25%可用余额）
+        'max_position_ratio': 0.30,  # 单次最大仓位比例（30%可用余额）
         'trend_strength_multiplier': 1.2
     }
 }
@@ -241,7 +241,7 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
 
         suggested_usdt = base_usdt * confidence_multiplier * trend_multiplier * rsi_multiplier
 
-        max_ratio = max(0.0, min(float(config.get('max_position_ratio', 0.25)), 1.0))
+        max_ratio = max(0.0, min(float(config.get('max_position_ratio', 0.30)), 1.0))
         max_usdt = usdt_balance * max_ratio
         final_usdt = max(0.0, min(suggested_usdt, max_usdt, usdt_balance))
 
