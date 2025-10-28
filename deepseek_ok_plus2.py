@@ -622,15 +622,16 @@ def build_order_params(
     if stop_loss is not None and stop_loss > 0:
         params['slTriggerPx'] = _format_price(stop_loss)
         params.setdefault('slOrdPx', '')  # 触发后市价止损
+        params.setdefault('slTriggerPxType', trigger_type)
         has_protection = True
 
     if take_profit is not None and take_profit > 0:
         params['tpTriggerPx'] = _format_price(take_profit)
         params.setdefault('tpOrdPx', '')  # 触发后市价止盈
+        params.setdefault('tpTriggerPxType', trigger_type)
         has_protection = True
 
     if has_protection:
-        params.setdefault('triggerPxType', trigger_type)
         params.setdefault('tdMode', 'cross')
 
     return params
