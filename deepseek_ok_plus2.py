@@ -131,10 +131,10 @@ TRADE_CONFIG = {
     },
     # 新增智能仓位参数
     'position_management': {
-        'base_usdt_amount': 100,  # USDT投入下单基数
-        'high_confidence_multiplier': 1.5,
-        'medium_confidence_multiplier': 1.0,
-        'low_confidence_multiplier': 0.5,
+        'base_usdt_amount': 150,  # USDT投入下单基数
+        'high_confidence_multiplier': 1.8,
+        'medium_confidence_multiplier': 1.2,
+        'low_confidence_multiplier': 0.7,
         'max_position_ratio': 10,  # 单次最大仓位比例（None 表示按可用余额上限）
         'trend_strength_multiplier': 1.2
     }
@@ -597,6 +597,43 @@ def calculate_dynamic_stop_loss_take_profit(signal: str, price_data: Dict[str, A
     take_profit = adjust_to_technical_levels(take_profit, price_data, signal, is_tp=True)
 
     return float(stop_loss), float(take_profit)
+
+
+def build_order_params(
+    symbol: str,
+    stop_loss: Optional[float] = None,
+    take_profit: Optional[float] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """构建下单参数，在可用时附加止损/止盈。"""
+
+    params: Dict[str, Any] = dict(extra or {})
+    params.setdefault('tag', ORDER_TAG)
+
+    def _format_price(price: float) -> str:
+        try:
+            return exchange.price_to_precision(symbol, price)
+        except Exception:  # noqa: BLE001 - 使用备用格式
+            return f"{price:.4f}"
+
+    has_protection = False
+    trigger_type = os.getenv('OKX_TRIGGER_PX_TYPE', 'mark')
+
+    if stop_loss is not None and stop_loss > 0:
+        params['slTriggerPx'] = _format_price(stop_loss)
+        params.setdefault('slOrdPx', '')  # 触发后市价止损
+        has_protection = True
+
+    if take_profit is not None and take_profit > 0:
+        params['tpTriggerPx'] = _format_price(take_profit)
+        params.setdefault('tpOrdPx', '')  # 触发后市价止盈
+        has_protection = True
+
+    if has_protection:
+        params.setdefault('triggerPxType', trigger_type)
+        params.setdefault('tdMode', 'cross')
+
+    return params
 
 
 def calculate_atr(df: pd.DataFrame, period: int = 14):
@@ -1235,6 +1272,15 @@ def execute_intelligent_trade(
     if current_position is None:
         current_position = get_current_position()
 
+    def _coerce_float(value: Any) -> Optional[float]:
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    stop_loss_price = _coerce_float(signal_data.get('stop_loss'))
+    take_profit_price = _coerce_float(signal_data.get('take_profit'))
+
     logger.info(
         "收到信号 %s（置信度 %s），理由：%s",
         signal_data.get('signal'),
@@ -1244,8 +1290,8 @@ def execute_intelligent_trade(
     if signal_data.get('signal') in ('BUY', 'SELL'):
         logger.info(
             "止损 %.2f | 止盈 %.2f | 过滤得分 %.2f",
-            float(signal_data.get('stop_loss', 0)),
-            float(signal_data.get('take_profit', 0)),
+            stop_loss_price or 0,
+            take_profit_price or 0,
             float(signal_data.get('filter_score', 0)),
         )
     logger.debug("当前持仓快照：%s", current_position)
@@ -1286,18 +1332,30 @@ def execute_intelligent_trade(
                         symbol,
                         'buy',
                         current_position['size'],
-                        params={'reduceOnly': True, 'tag': ORDER_TAG}
+                        params=build_order_params(symbol, extra={'reduceOnly': True})
                     )
                     time.sleep(1)
                 else:
                     logger.warning("检测到空头持仓数量为 0，跳过平仓步骤")
 
-                logger.info("开多 %.2f 张", position_size)
+                if stop_loss_price or take_profit_price:
+                    logger.info(
+                        "开多 %.2f 张（附保护止损 %.2f / 止盈 %.2f）",
+                        position_size,
+                        stop_loss_price or 0,
+                        take_profit_price or 0,
+                    )
+                else:
+                    logger.info("开多 %.2f 张", position_size)
                 exchange.create_market_order(
                     symbol,
                     'buy',
                     position_size,
-                    params={'tag': ORDER_TAG}
+                    params=build_order_params(
+                        symbol,
+                        stop_loss=stop_loss_price,
+                        take_profit=take_profit_price,
+                    ),
                 )
 
             elif current_position and current_position['side'] == 'long':
@@ -1313,7 +1371,11 @@ def execute_intelligent_trade(
                             symbol,
                             'buy',
                             size_diff,
-                            params={'tag': ORDER_TAG}
+                            params=build_order_params(
+                                symbol,
+                                stop_loss=stop_loss_price,
+                                take_profit=take_profit_price,
+                            ),
                         )
                     else:
                         reduce_size = abs(size_diff)
@@ -1326,7 +1388,7 @@ def execute_intelligent_trade(
                             symbol,
                             'sell',
                             reduce_size,
-                            params={'reduceOnly': True, 'tag': ORDER_TAG}
+                            params=build_order_params(symbol, extra={'reduceOnly': True})
                         )
                 else:
                     logger.info(
@@ -1335,12 +1397,24 @@ def execute_intelligent_trade(
                         position_size,
                     )
             else:
-                logger.info("新开多头 %.2f 张", position_size)
+                if stop_loss_price or take_profit_price:
+                    logger.info(
+                        "新开多头 %.2f 张（附保护止损 %.2f / 止盈 %.2f）",
+                        position_size,
+                        stop_loss_price or 0,
+                        take_profit_price or 0,
+                    )
+                else:
+                    logger.info("新开多头 %.2f 张", position_size)
                 exchange.create_market_order(
                     symbol,
                     'buy',
                     position_size,
-                    params={'tag': ORDER_TAG}
+                    params=build_order_params(
+                        symbol,
+                        stop_loss=stop_loss_price,
+                        take_profit=take_profit_price,
+                    ),
                 )
 
         elif target_side == 'SELL':
@@ -1354,18 +1428,30 @@ def execute_intelligent_trade(
                         symbol,
                         'sell',
                         current_position['size'],
-                        params={'reduceOnly': True, 'tag': ORDER_TAG}
+                        params=build_order_params(symbol, extra={'reduceOnly': True})
                     )
                     time.sleep(1)
                 else:
                     logger.warning("检测到多头持仓数量为 0，跳过平仓步骤")
 
-                logger.info("开空 %.2f 张", position_size)
+                if stop_loss_price or take_profit_price:
+                    logger.info(
+                        "开空 %.2f 张（附保护止损 %.2f / 止盈 %.2f）",
+                        position_size,
+                        stop_loss_price or 0,
+                        take_profit_price or 0,
+                    )
+                else:
+                    logger.info("开空 %.2f 张", position_size)
                 exchange.create_market_order(
                     symbol,
                     'sell',
                     position_size,
-                    params={'tag': ORDER_TAG}
+                    params=build_order_params(
+                        symbol,
+                        stop_loss=stop_loss_price,
+                        take_profit=take_profit_price,
+                    ),
                 )
 
             elif current_position and current_position['side'] == 'short':
@@ -1381,7 +1467,11 @@ def execute_intelligent_trade(
                             symbol,
                             'sell',
                             size_diff,
-                            params={'tag': ORDER_TAG}
+                            params=build_order_params(
+                                symbol,
+                                stop_loss=stop_loss_price,
+                                take_profit=take_profit_price,
+                            ),
                         )
                     else:
                         reduce_size = abs(size_diff)
@@ -1394,7 +1484,7 @@ def execute_intelligent_trade(
                             symbol,
                             'buy',
                             reduce_size,
-                            params={'reduceOnly': True, 'tag': ORDER_TAG}
+                            params=build_order_params(symbol, extra={'reduceOnly': True})
                         )
                 else:
                     logger.info(
@@ -1403,12 +1493,24 @@ def execute_intelligent_trade(
                         position_size,
                     )
             else:
-                logger.info("新开空头 %.2f 张", position_size)
+                if stop_loss_price or take_profit_price:
+                    logger.info(
+                        "新开空头 %.2f 张（附保护止损 %.2f / 止盈 %.2f）",
+                        position_size,
+                        stop_loss_price or 0,
+                        take_profit_price or 0,
+                    )
+                else:
+                    logger.info("新开空头 %.2f 张", position_size)
                 exchange.create_market_order(
                     symbol,
                     'sell',
                     position_size,
-                    params={'tag': ORDER_TAG}
+                    params=build_order_params(
+                        symbol,
+                        stop_loss=stop_loss_price,
+                        take_profit=take_profit_price,
+                    ),
                 )
 
         logger.info("信号 %s 执行完成", target_side)
@@ -1428,7 +1530,11 @@ def execute_intelligent_trade(
                     TRADE_CONFIG['symbol'],
                     order_side,
                     position_size,
-                    params={'tag': ORDER_TAG}
+                    params=build_order_params(
+                        TRADE_CONFIG['symbol'],
+                        stop_loss=stop_loss_price,
+                        take_profit=take_profit_price,
+                    ),
                 )
                 logger.info("备用下单成功")
             except Exception as nested_exc:  # noqa: BLE001
