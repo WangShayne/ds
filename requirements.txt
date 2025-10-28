@@ -1,6 +1,7 @@
 Flask
 ccxt
 openai
+numpy
 pandas
 schedule
 python-dotenv

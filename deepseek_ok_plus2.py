@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, Optional
 
 import ccxt
+import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
@@ -338,6 +339,408 @@ def calculate_technical_indicators(df):
         return df
 
 
+def get_multi_timeframe_analysis():
+    """多时间框架分析，用于确认不同周期的趋势方向。"""
+    timeframes = ['15m', '1h', '4h']
+    analysis: Dict[str, Dict[str, Any]] = {}
+
+    for tf in timeframes:
+        try:
+            ohlcv = exchange.fetch_ohlcv(TRADE_CONFIG['symbol'], tf, limit=50)
+            if not ohlcv:
+                raise ValueError("OHLCV 数据为空")
+
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df = calculate_technical_indicators(df)
+
+            current_price = float(df['close'].iloc[-1])
+            trend = get_market_trend(df)
+
+            analysis[tf] = {
+                'price': current_price,
+                'trend': trend.get('overall', '未知'),
+                'rsi': float(df['rsi'].iloc[-1]),
+                'sma_20': float(df['sma_20'].iloc[-1]),
+                'sma_50': float(df['sma_50'].iloc[-1]),
+                'macd_signal': 'bullish' if df['macd'].iloc[-1] > df['macd_signal'].iloc[-1] else 'bearish'
+            }
+        except Exception as exc:
+            logger.warning("时间框架 %s 分析失败: %s", tf, exc)
+
+    return analysis
+
+
+def get_trend_alignment(multi_tf_analysis: Dict[str, Dict[str, Any]]):
+    """判断多时间框架趋势一致性。"""
+    if not multi_tf_analysis:
+        return 'UNKNOWN', 0.0
+
+    trends = [
+        details.get('trend')
+        for details in multi_tf_analysis.values()
+        if details.get('trend')
+    ]
+    if not trends:
+        return 'UNKNOWN', 0.0
+
+    total = len(trends)
+    bullish_count = trends.count('强势上涨')
+    bearish_count = trends.count('强势下跌')
+
+    if total == 0:
+        return 'UNKNOWN', 0.0
+
+    bullish_ratio = bullish_count / total
+    bearish_ratio = bearish_count / total
+
+    if bullish_ratio >= 0.67:
+        return 'STRONG_BULLISH', bullish_ratio
+    if bearish_ratio >= 0.67:
+        return 'STRONG_BEARISH', bearish_ratio
+
+    return 'MIXED', max(bullish_ratio, bearish_ratio)
+
+
+def detect_price_patterns(df: pd.DataFrame):
+    """识别价格行为模式，用于辅助判断突破与反转。"""
+    patterns: Dict[str, Any] = {}
+    try:
+        if df.empty:
+            return patterns
+
+        recent_data = df.tail(10)
+        highs = recent_data['high']
+        lows = recent_data['low']
+        closes = recent_data['close']
+
+        resistance_level = highs.head(5).max()
+        support_level = lows.head(5).min()
+
+        current_high = highs.iloc[-1]
+        current_low = lows.iloc[-1]
+        current_close = closes.iloc[-1]
+
+        if current_high > resistance_level:
+            patterns['resistance_break'] = {
+                'type': 'BULLISH_BREAKOUT',
+                'level': float(resistance_level),
+                'strength': float((current_high - resistance_level) / resistance_level) if resistance_level else 0.0
+            }
+
+        if current_low < support_level:
+            patterns['support_break'] = {
+                'type': 'BEARISH_BREAKOUT',
+                'level': float(support_level),
+                'strength': float((support_level - current_low) / support_level) if support_level else 0.0
+            }
+
+        patterns['candle_patterns'] = detect_candle_patterns(recent_data)
+        patterns['volume_confirmation'] = detect_volume_confirmation(recent_data)
+        patterns['last_close'] = float(current_close)
+    except Exception as exc:
+        logger.warning("价格模式识别失败: %s", exc)
+
+    return patterns
+
+
+def detect_candle_patterns(df: pd.DataFrame):
+    """识别关键K线形态。"""
+    patterns: list[str] = []
+    if len(df) < 3:
+        return patterns
+
+    current = df.iloc[-1]
+    prev1 = df.iloc[-2]
+    prev2 = df.iloc[-3]
+
+    if (
+        current['close'] > current['open']
+        and prev1['close'] < prev1['open']
+        and current['open'] < prev1['close']
+        and current['close'] > prev1['open']
+    ):
+        patterns.append('BULLISH_ENGULFING')
+
+    if (
+        current['close'] < current['open']
+        and prev1['close'] > prev1['open']
+        and current['open'] > prev1['close']
+        and current['close'] < prev1['open']
+    ):
+        patterns.append('BEARISH_ENGULFING')
+
+    # 早晨之星（简化版）
+    prev1_open = prev1['open']
+    if (
+        prev2['close'] < prev2['open']
+        and prev1_open != 0
+        and abs(prev1['close'] - prev1_open) / prev1_open < 0.001
+        and current['close'] > current['open']
+        and current['close'] > (prev2['open'] + prev2['close']) / 2
+    ):
+        patterns.append('MORNING_STAR')
+
+    return patterns
+
+
+def detect_volume_confirmation(df: pd.DataFrame):
+    """成交量确认，用于验证价格行为信号。"""
+    if len(df) < 3:
+        return {'signal': 'INSUFFICIENT_DATA', 'volume_ratio': 0.0}
+
+    current = df.iloc[-1]
+    prev_volume_avg = df['volume'].head(-1).mean()
+
+    volume_ratio = current['volume'] / prev_volume_avg if prev_volume_avg and prev_volume_avg > 0 else 1.0
+    price_change = (current['close'] - current['open']) / current['open'] if current['open'] else 0.0
+
+    if volume_ratio > 1.2 and price_change > 0.002:
+        signal = 'BULLISH_CONFIRMATION'
+    elif volume_ratio > 1.2 and price_change < -0.002:
+        signal = 'BEARISH_CONFIRMATION'
+    elif volume_ratio < 0.8:
+        signal = 'LOW_CONVICTION'
+    else:
+        signal = 'NEUTRAL'
+
+    return {'signal': signal, 'volume_ratio': float(volume_ratio)}
+
+
+def identify_market_regime(df: pd.DataFrame):
+    """识别市场状态（趋势/震荡）。"""
+    try:
+        adx = calculate_adx(df)
+        bb_middle = float(df['bb_middle'].iloc[-1])
+        bb_diff = float(df['bb_upper'].iloc[-1] - df['bb_lower'].iloc[-1])
+        bb_width = (bb_diff / bb_middle) if bb_middle else 0.0
+        rsi = float(df['rsi'].iloc[-1])
+
+        if adx > 25:
+            regime = 'STRONG_UPTREND' if df['close'].iloc[-1] > df['sma_20'].iloc[-1] else 'STRONG_DOWNTREND'
+        elif bb_width > 0.03:
+            regime = 'HIGH_VOLATILITY'
+        elif rsi > 70 or rsi < 30:
+            regime = 'EXTREME_CONDITION'
+        else:
+            regime = 'RANGING'
+
+        return {
+            'regime': regime,
+            'adx': float(adx),
+            'bb_width': bb_width,
+            'rsi': rsi
+        }
+    except Exception as exc:
+        logger.warning("市场状态识别失败: %s", exc)
+        return {'regime': 'UNKNOWN'}
+
+
+def calculate_adx(df: pd.DataFrame, period: int = 14):
+    """计算ADX（平均趋向指数）。"""
+    try:
+        high = df['high']
+        low = df['low']
+        close = df['close']
+
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(period).mean()
+
+        up_move = high.diff()
+        down_move = -low.diff()
+
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+        plus_di = 100 * (pd.Series(plus_dm, index=df.index).rolling(period).mean() / atr)
+        minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(period).mean() / atr)
+
+        di_sum = plus_di + minus_di
+        dx = 100 * ((plus_di - minus_di).abs() / di_sum.replace(0, np.nan))
+        adx = dx.rolling(period).mean()
+
+        return float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 0.0
+    except Exception:
+        return 0.0
+
+
+def calculate_dynamic_stop_loss_take_profit(signal: str, price_data: Dict[str, Any], position_size: float):
+    """计算动态止损止盈以适配波动性与仓位大小。"""
+    current_price = float(price_data['price'])
+    full_df: pd.DataFrame = price_data.get('full_data', pd.DataFrame())
+    atr = calculate_atr(full_df)
+    volatility_factor = (atr / current_price) if current_price else 0.0
+
+    base_risk_percent = 0.015
+    if volatility_factor > 0.02:
+        risk_percent = base_risk_percent * 0.7
+    elif volatility_factor < 0.005 and volatility_factor > 0:
+        risk_percent = base_risk_percent * 1.3
+    else:
+        risk_percent = base_risk_percent
+
+    if position_size > 10:
+        risk_percent *= 0.8
+    elif position_size < 2:
+        risk_percent *= 1.2
+
+    if signal == 'BUY':
+        stop_loss = current_price * (1 - risk_percent)
+        take_profit = current_price * (1 + risk_percent * 2)
+    else:
+        stop_loss = current_price * (1 + risk_percent)
+        take_profit = current_price * (1 - risk_percent * 2)
+
+    stop_loss = adjust_to_technical_levels(stop_loss, price_data, signal)
+    take_profit = adjust_to_technical_levels(take_profit, price_data, signal, is_tp=True)
+
+    return float(stop_loss), float(take_profit)
+
+
+def calculate_atr(df: pd.DataFrame, period: int = 14):
+    """计算平均真实波幅（ATR）。"""
+    if df.empty:
+        return 0.0
+
+    high = df['high']
+    low = df['low']
+    close = df['close']
+
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+
+    last_atr = atr.iloc[-1] if not atr.empty else 0.0
+    return float(last_atr) if not pd.isna(last_atr) else 0.0
+
+
+def adjust_to_technical_levels(price: float, price_data: Dict[str, Any], signal: str, is_tp: bool = False):
+    """根据支撑阻力等技术位对价格进行微调。"""
+    levels = price_data.get('levels_analysis', {})
+    adjusted_price = price
+
+    if signal == 'BUY':
+        if not is_tp:
+            support = levels.get('static_support', 0)
+            if support and price < support:
+                adjusted_price = float(support) * 0.995
+        else:
+            resistance = levels.get('static_resistance', 0)
+            if resistance and price > resistance:
+                adjusted_price = float(resistance) * 0.995
+    else:
+        if not is_tp:
+            resistance = levels.get('static_resistance', 0)
+            if resistance and price > resistance:
+                adjusted_price = float(resistance) * 1.005
+        else:
+            support = levels.get('static_support', 0)
+            if support and price < support:
+                adjusted_price = float(support) * 1.005
+
+    return adjusted_price
+
+
+def apply_signal_filters(
+    signal_data: Dict[str, Any],
+    price_data: Dict[str, Any],
+    multi_tf_analysis: Dict[str, Dict[str, Any]],
+    market_regime: Dict[str, Any],
+):
+    """应用多维过滤器，提升信号质量。"""
+    filters = {
+        'trend_alignment': False,
+        'volume_confirmation': False,
+        'risk_reward_ok': False,
+        'market_regime_appropriate': False
+    }
+
+    signal = signal_data.get('signal')
+    current_price = float(price_data.get('price', 0))
+
+    if signal not in ('BUY', 'SELL'):
+        original_confidence = signal_data.get('confidence')
+        signal_data['filters'] = filters
+        signal_data['filter_score'] = 0.0
+        signal_data['original_confidence'] = original_confidence
+        signal_data['confidence'] = original_confidence
+        signal_data['trend_alignment_score'] = 0.0
+        return signal_data
+
+    trend_alignment, alignment_score = get_trend_alignment(multi_tf_analysis)
+    if (
+        signal == 'BUY' and trend_alignment in ['STRONG_BULLISH', 'MIXED']
+    ) or (
+        signal == 'SELL' and trend_alignment in ['STRONG_BEARISH', 'MIXED']
+    ):
+        filters['trend_alignment'] = True
+
+    volume_info = price_data.get('volume_analysis') or {}
+    volume_signal = volume_info.get('signal', 'NEUTRAL')
+    if (
+        signal == 'BUY' and volume_signal in ['BULLISH_CONFIRMATION', 'NEUTRAL']
+    ) or (
+        signal == 'SELL' and volume_signal in ['BEARISH_CONFIRMATION', 'NEUTRAL']
+    ):
+        filters['volume_confirmation'] = True
+
+    stop_loss = float(signal_data.get('stop_loss', current_price))
+    take_profit = float(signal_data.get('take_profit', current_price))
+
+    if signal == 'BUY':
+        risk = max(current_price - stop_loss, 0)
+        reward = max(take_profit - current_price, 0)
+    else:
+        risk = max(stop_loss - current_price, 0)
+        reward = max(current_price - take_profit, 0)
+
+    risk_reward_ratio = (reward / risk) if risk > 0 else 0
+    filters['risk_reward_ok'] = risk_reward_ratio >= 1.5
+
+    regime = market_regime.get('regime', 'UNKNOWN')
+    if regime in ['STRONG_UPTREND', 'STRONG_DOWNTREND']:
+        filters['market_regime_appropriate'] = True
+    elif regime == 'RANGING':
+        filters['market_regime_appropriate'] = signal_data.get('confidence') == 'HIGH'
+    else:
+        filters['market_regime_appropriate'] = True
+
+    passed_filters = sum(filters.values())
+    total_filters = len(filters)
+    filter_score = passed_filters / total_filters if total_filters else 0
+
+    original_confidence = signal_data.get('confidence')
+    if filter_score >= 0.75:
+        adjusted_confidence = 'HIGH'
+    elif filter_score >= 0.5:
+        adjusted_confidence = 'MEDIUM'
+    else:
+        adjusted_confidence = 'LOW'
+
+    signal_data['filters'] = filters
+    signal_data['filter_score'] = filter_score
+    signal_data['original_confidence'] = original_confidence
+    signal_data['confidence'] = adjusted_confidence
+    signal_data['trend_alignment_score'] = alignment_score
+
+    logger.info(
+        "信号过滤结果: %s/%s 通过, 得分: %.2f, 信心调整: %s → %s",
+        passed_filters,
+        total_filters,
+        filter_score,
+        original_confidence,
+        adjusted_confidence,
+    )
+
+    return signal_data
+
+
+
 def get_support_resistance_levels(df, lookback=20):
     """计算支撑阻力位"""
     try:
@@ -495,6 +898,11 @@ def get_btc_ohlcv_enhanced():
         # 获取技术分析数据
         trend_analysis = get_market_trend(df)
         levels_analysis = get_support_resistance_levels(df)
+        multi_tf_analysis = get_multi_timeframe_analysis()
+        trend_alignment_status, trend_alignment_score = get_trend_alignment(multi_tf_analysis)
+        price_patterns = detect_price_patterns(df)
+        market_regime = identify_market_regime(df)
+        volume_analysis = price_patterns.get('volume_confirmation', {})
 
         return {
             'price': current_data['close'],
@@ -520,6 +928,14 @@ def get_btc_ohlcv_enhanced():
             },
             'trend_analysis': trend_analysis,
             'levels_analysis': levels_analysis,
+            'multi_timeframe_analysis': multi_tf_analysis,
+            'trend_alignment': {
+                'status': trend_alignment_status,
+                'score': trend_alignment_score
+            },
+            'market_regime': market_regime,
+            'price_patterns': price_patterns,
+            'volume_analysis': volume_analysis,
             'full_data': df
         }
     except Exception as e:
@@ -809,9 +1225,15 @@ def analyze_with_deepseek(price_data):
         return create_fallback_signal(price_data)
 
 
-def execute_intelligent_trade(signal_data, price_data):
+def execute_intelligent_trade(
+    signal_data: Dict[str, Any],
+    price_data: Dict[str, Any],
+    current_position: Optional[Dict[str, Any]] = None,
+    precomputed_position_size: Optional[float] = None,
+):
     """执行智能交易 - OKX版本（支持同方向加仓减仓）"""
-    current_position = get_current_position()
+    if current_position is None:
+        current_position = get_current_position()
 
     logger.info(
         "收到信号 %s（置信度 %s），理由：%s",
@@ -819,13 +1241,23 @@ def execute_intelligent_trade(signal_data, price_data):
         signal_data.get('confidence'),
         signal_data.get('reason'),
     )
+    if signal_data.get('signal') in ('BUY', 'SELL'):
+        logger.info(
+            "止损 %.2f | 止盈 %.2f | 过滤得分 %.2f",
+            float(signal_data.get('stop_loss', 0)),
+            float(signal_data.get('take_profit', 0)),
+            float(signal_data.get('filter_score', 0)),
+        )
     logger.debug("当前持仓快照：%s", current_position)
 
     if signal_data.get('signal') == 'HOLD':
         logger.info("收到 HOLD 信号，跳过下单")
         return current_position
 
-    position_size = calculate_intelligent_position(signal_data, price_data, current_position)
+    if precomputed_position_size is not None:
+        position_size = precomputed_position_size
+    else:
+        position_size = calculate_intelligent_position(signal_data, price_data, current_position)
 
     if signal_data.get('confidence') == 'LOW' and not TRADE_CONFIG['test_mode']:
         logger.info("实盘模式下跳过低置信度信号")
@@ -1046,6 +1478,11 @@ def publish_monitoring_snapshot(
                 'price_change': price_data.get('price_change'),
                 'trend_analysis': price_data.get('trend_analysis'),
                 'levels_analysis': price_data.get('levels_analysis'),
+                'market_regime': price_data.get('market_regime'),
+                'trend_alignment': price_data.get('trend_alignment'),
+                'price_patterns': price_data.get('price_patterns'),
+                'multi_timeframe_analysis': price_data.get('multi_timeframe_analysis'),
+                'volume_analysis': price_data.get('volume_analysis'),
             }
 
         payload: Dict[str, Any] = {
@@ -1129,8 +1566,71 @@ def trading_bot():
     if signal_data.get('is_fallback', False):
         logger.warning("因分析异常使用备用交易信号")
 
+    current_position = get_current_position()
+    precomputed_position_size: Optional[float] = None
+
+    multi_tf_analysis = price_data.get('multi_timeframe_analysis', {})
+    market_regime = price_data.get('market_regime', {})
+
+    if price_data.get('trend_alignment'):
+        alignment = price_data['trend_alignment']
+        logger.info(
+            "多周期趋势一致性：%s (得分 %.2f)",
+            alignment.get('status'),
+            alignment.get('score', 0),
+        )
+
+    if market_regime:
+        logger.info(
+            "市场状态：%s | ADX %.2f | 布林带宽 %.3f",
+            market_regime.get('regime', 'UNKNOWN'),
+            float(market_regime.get('adx', 0)),
+            float(market_regime.get('bb_width', 0)),
+        )
+
+    if signal_data.get('signal') in ('BUY', 'SELL'):
+        precomputed_position_size = calculate_intelligent_position(signal_data, price_data, current_position)
+        try:
+            stop_loss, take_profit = calculate_dynamic_stop_loss_take_profit(
+                signal_data['signal'],
+                price_data,
+                precomputed_position_size,
+            )
+            signal_data['stop_loss'] = stop_loss
+            signal_data['take_profit'] = take_profit
+        except Exception as exc:
+            logger.warning("动态止损止盈计算失败：%s", exc)
+
+    signal_data = apply_signal_filters(
+        signal_data,
+        price_data,
+        multi_tf_analysis,
+        market_regime,
+    )
+
+    if (
+        signal_data.get('signal') in ('BUY', 'SELL')
+        and signal_data.get('confidence') != signal_data.get('original_confidence')
+    ):
+        precomputed_position_size = calculate_intelligent_position(signal_data, price_data, current_position)
+        try:
+            stop_loss, take_profit = calculate_dynamic_stop_loss_take_profit(
+                signal_data['signal'],
+                price_data,
+                precomputed_position_size,
+            )
+            signal_data['stop_loss'] = stop_loss
+            signal_data['take_profit'] = take_profit
+        except Exception as exc:
+            logger.warning("动态止损止盈二次调整失败：%s", exc)
+
     try:
-        latest_position = execute_intelligent_trade(signal_data, price_data)
+        latest_position = execute_intelligent_trade(
+            signal_data,
+            price_data,
+            current_position=current_position,
+            precomputed_position_size=precomputed_position_size,
+        )
         publish_monitoring_snapshot(price_data, signal_data, latest_position)
     except Exception as exc:  # noqa: BLE001 - ensure monitoring is updated on failure
         logger.exception("执行交易时出现意外错误：%s", exc)
