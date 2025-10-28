@@ -610,25 +610,26 @@ def build_order_params(
     params: Dict[str, Any] = dict(extra or {})
     params.setdefault('tag', ORDER_TAG)
 
-    def _format_price(price: float) -> str:
+    def _format_price(price: float) -> float:
         try:
-            return exchange.price_to_precision(symbol, price)
+            precise = exchange.price_to_precision(symbol, price)
+            return float(precise)
         except Exception:  # noqa: BLE001 - 使用备用格式
-            return f"{price:.4f}"
+            return float(f"{price:.4f}")
 
     has_protection = False
-    trigger_type = os.getenv('OKX_TRIGGER_PX_TYPE', 'mark')
+    trigger_type = os.getenv('OKX_TRIGGER_PX_TYPE', 'last')
 
     if stop_loss is not None and stop_loss > 0:
-        params['slTriggerPx'] = _format_price(stop_loss)
-        params.setdefault('slOrdPx', '')  # 触发后市价止损
-        params.setdefault('slTriggerPxType', trigger_type)
+        payload = params.setdefault('stopLoss', {})
+        payload['triggerPrice'] = _format_price(stop_loss)
+        payload.setdefault('triggerPriceType', trigger_type)
         has_protection = True
 
     if take_profit is not None and take_profit > 0:
-        params['tpTriggerPx'] = _format_price(take_profit)
-        params.setdefault('tpOrdPx', '')  # 触发后市价止盈
-        params.setdefault('tpTriggerPxType', trigger_type)
+        payload = params.setdefault('takeProfit', {})
+        payload['triggerPrice'] = _format_price(take_profit)
+        payload.setdefault('triggerPriceType', trigger_type)
         has_protection = True
 
     if has_protection:
