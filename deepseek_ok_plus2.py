@@ -661,28 +661,45 @@ def calculate_atr(df: pd.DataFrame, period: int = 14):
 def adjust_to_technical_levels(price: float, price_data: Dict[str, Any], signal: str, is_tp: bool = False):
     """根据支撑阻力等技术位对价格进行微调。"""
     levels = price_data.get('levels_analysis', {})
-    adjusted_price = price
+    adjusted_price = float(price)
+    current_price = float(price_data.get('price', 0) or 0)
 
     if signal == 'BUY':
         if not is_tp:
-            support = levels.get('static_support', 0)
-            if support and price < support:
-                adjusted_price = float(support) * 0.995
+            support = levels.get('static_support')
+            if support:
+                candidate = float(support) * 0.995
+                if candidate < adjusted_price:
+                    adjusted_price = candidate
+            if current_price > 0:
+                adjusted_price = min(adjusted_price, current_price * 0.999)
         else:
-            resistance = levels.get('static_resistance', 0)
-            if resistance and price > resistance:
-                adjusted_price = float(resistance) * 0.995
+            resistance = levels.get('static_resistance')
+            if resistance:
+                candidate = float(resistance) * 0.995
+                if candidate > adjusted_price:
+                    adjusted_price = candidate
+            if current_price > 0:
+                adjusted_price = max(adjusted_price, current_price * 1.001)
     else:
         if not is_tp:
-            resistance = levels.get('static_resistance', 0)
-            if resistance and price > resistance:
-                adjusted_price = float(resistance) * 1.005
+            resistance = levels.get('static_resistance')
+            if resistance:
+                candidate = float(resistance) * 1.005
+                if candidate > adjusted_price:
+                    adjusted_price = candidate
+            if current_price > 0:
+                adjusted_price = max(adjusted_price, current_price * 1.001)
         else:
-            support = levels.get('static_support', 0)
-            if support and price < support:
-                adjusted_price = float(support) * 1.005
+            support = levels.get('static_support')
+            if support:
+                candidate = float(support) * 1.005
+                if candidate < adjusted_price:
+                    adjusted_price = candidate
+            if current_price > 0:
+                adjusted_price = min(adjusted_price, current_price * 0.999)
 
-    return adjusted_price
+    return max(adjusted_price, 0.0)
 
 
 def apply_signal_filters(
