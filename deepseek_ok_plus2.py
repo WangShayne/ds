@@ -135,8 +135,9 @@ TRADE_CONFIG = {
         'high_confidence_multiplier': 1.8,
         'medium_confidence_multiplier': 1.2,
         'low_confidence_multiplier': 0.7,
-        'max_position_ratio': 10,  # 单次最大仓位比例（None 表示按可用余额上限）
-        'trend_strength_multiplier': 1.2
+        'max_position_ratio': 10,  # <=1 表示余额占比, >1 视为杠杆倍数上限
+        'trend_strength_multiplier': 1.2,
+        'leverage_utilization': 3.0  # 利用杠杆的倍数, 会被杠杆上限约束
     }
 }
 
@@ -247,17 +248,29 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
         raw_ratio = config.get('max_position_ratio')
         max_usdt = None
         if raw_ratio is not None:
-            max_ratio = max(0.0, min(float(raw_ratio), 1.0))
-            max_usdt = usdt_balance * max_ratio
-            cap_candidates.append(max_usdt)
+            ratio = float(raw_ratio)
+            if ratio <= 1:
+                max_ratio = max(0.0, ratio)
+                max_usdt = usdt_balance * max_ratio
+            else:
+                leverage_cap = max(1.0, float(TRADE_CONFIG.get('leverage', 1)))
+                multiplier = max(1.0, min(ratio, leverage_cap))
+                max_usdt = usdt_balance * multiplier
+            if max_usdt is not None:
+                cap_candidates.append(max_usdt)
 
         final_usdt = max(0.0, min(cap_candidates))
+
+        leverage_cap = max(1.0, float(TRADE_CONFIG.get('leverage', 1)))
+        leverage_util = max(1.0, float(config.get('leverage_utilization', 1.0)))
+        leverage_multiplier = min(leverage_util, leverage_cap)
 
         contract_denom = price_data['price'] * TRADE_CONFIG['contract_size']
         if contract_denom <= 0:
             raise ValueError("Invalid contract denominator for position sizing")
 
-        contract_size = final_usdt / contract_denom
+        notional_usdt = final_usdt * leverage_multiplier
+        contract_size = notional_usdt / contract_denom
         contract_size = round(contract_size, 2)
 
         min_contracts = TRADE_CONFIG.get('min_amount', 0.01)
@@ -266,18 +279,20 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
             logger.warning("仓位小于最小下单量，调整为 %.2f 张", contract_size)
 
         logger.info(
-            "仓位计算完成：余额 %.2f USDT，最终使用 %.2f USDT，对应 %.2f 张",
+            "仓位计算完成：余额 %.2f USDT，实际保证金 %.2f USDT，名义仓位 %.2f USDT，对应 %.2f 张",
             usdt_balance,
             final_usdt,
+            notional_usdt,
             contract_size,
         )
         logger.debug(
-            "仓位明细 | 基础 %.2f | 置信 %.2f | 趋势 %.2f | RSI %.2f | 建议 %.2f | 上限 %s",
+            "仓位明细 | 基础 %.2f | 置信 %.2f | 趋势 %.2f | RSI %.2f | 建议 %.2f | 杠杆利用 %.2f | 上限 %s",
             base_usdt,
             confidence_multiplier,
             trend_multiplier,
             rsi_multiplier,
             suggested_usdt,
+            leverage_multiplier,
             f"{max_usdt:.2f}" if max_usdt is not None else "不限制",
         )
 
@@ -286,7 +301,9 @@ def calculate_intelligent_position(signal_data, price_data, current_position):
     except Exception as e:
         logger.exception("仓位智能计算失败：%s", e)
         base_usdt = float(config['base_usdt_amount'])
-        contract_size = (base_usdt * TRADE_CONFIG['leverage']) / (
+        leverage_cap = max(1.0, float(TRADE_CONFIG.get('leverage', 1)))
+        notional = base_usdt * leverage_cap
+        contract_size = notional / (
             price_data['price'] * TRADE_CONFIG.get('contract_size', 0.01)
         )
         fallback_size = round(max(contract_size, TRADE_CONFIG.get('min_amount', 0.01)), 2)
@@ -657,9 +674,6 @@ def synchronize_position_protection(
         return
 
     set_tp_sl = getattr(exchange, 'privatePostTradeSetPositionTpsl', None)
-    if set_tp_sl is None:
-        logger.warning("当前 ccxt 客户端不支持 setPositionTpSl 接口，跳过位置保护刷新")
-        return
 
     trigger_type = os.getenv('OKX_TRIGGER_PX_TYPE', 'last')
 
@@ -698,8 +712,19 @@ def synchronize_position_protection(
         return
 
     try:
-        response = set_tp_sl(payload)
+        if set_tp_sl is not None:
+            response = set_tp_sl(payload)
+        else:
+            logger.debug("调用 trade/set-position-tpsl 原始端点同步保护单")
+            response = exchange.request(
+                'trade/set-position-tpsl',
+                'private',
+                'POST',
+                payload,
+            )
         logger.info("已同步位置止盈止损：%s", response)
+    except AttributeError:
+        logger.warning("当前 ccxt 版本缺少 setPositionTpSl，且无法直接调用原始接口")
     except Exception as exc:  # noqa: BLE001
         logger.warning("位置止盈止损同步失败：%s", exc)
 
