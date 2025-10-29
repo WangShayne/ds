@@ -674,6 +674,8 @@ def synchronize_position_protection(
         return
 
     set_tp_sl = getattr(exchange, 'privatePostTradeSetPositionTpsl', None)
+    order_algo = getattr(exchange, 'privatePostTradeOrderAlgo', None)
+    cancel_algos = getattr(exchange, 'privatePostTradeCancelAlgos', None)
 
     trigger_type = os.getenv('OKX_TRIGGER_PX_TYPE', 'last')
 
@@ -693,6 +695,7 @@ def synchronize_position_protection(
         payload['posSide'] = pos_side
     elif signal_side in ('BUY', 'SELL'):
         payload['posSide'] = 'long' if signal_side == 'BUY' else 'short'
+        pos_side = payload['posSide']
 
     def _assign(price: Optional[float], trigger_key: str, order_key: str, type_key: str) -> None:
         if price is None or price <= 0:
@@ -714,17 +717,73 @@ def synchronize_position_protection(
     try:
         if set_tp_sl is not None:
             response = set_tp_sl(payload)
-        else:
-            logger.debug("调用 trade/set-position-tpsl 原始端点同步保护单")
-            response = exchange.request(
-                'trade/set-position-tpsl',
-                'private',
-                'POST',
-                payload,
-            )
-        logger.info("已同步位置止盈止损：%s", response)
+            logger.info("已同步位置止盈止损：%s", response)
+            return
+
+        logger.debug("使用 order-algo 作为位置保护兜底方案")
+
+        if order_algo is None:
+            order_algo = lambda body: exchange.request('trade/order-algo', 'private', 'POST', body)
+
+        if cancel_algos is None:
+            cancel_algos = lambda body: exchange.request('trade/cancel-algos', 'private', 'POST', body)
+
+        algo_ids = []
+        pos_label = (payload.get('posSide') or pos_side or 'net').upper()
+        if take_profit:
+            algo_ids.append({'instId': inst_id, 'algoClOrdId': f"{BOT_NAME}_{pos_label}_TP"})
+        if stop_loss:
+            algo_ids.append({'instId': inst_id, 'algoClOrdId': f"{BOT_NAME}_{pos_label}_SL"})
+
+        if algo_ids:
+            try:
+                cancel_algos(algo_ids)
+            except Exception as cancel_exc:  # noqa: BLE001
+                logger.debug("取消旧位置保护单失败（可忽略）：%s", cancel_exc)
+
+        position_side = position.get('side') or ('long' if signal_side == 'BUY' else 'short')
+        closing_side = 'sell' if position_side == 'long' else 'buy'
+        amount_precise = exchange.amount_to_precision(
+            TRADE_CONFIG['symbol'],
+            position['size'],
+        )
+
+        if take_profit:
+            tp_payload = {
+                'instId': inst_id,
+                'tdMode': 'cross',
+                'side': closing_side,
+                'ordType': 'tp',
+                'sz': amount_precise,
+                'tpTriggerPx': payload['tpTriggerPx'],
+                'tpOrdPx': '0',
+                'tpTriggerPxType': trigger_type,
+                'algoClOrdId': f"{BOT_NAME}_{pos_label}_TP",
+            }
+            if payload.get('posSide'):
+                tp_payload['posSide'] = payload['posSide']
+            order_algo(tp_payload)
+
+        if stop_loss:
+            sl_payload = {
+                'instId': inst_id,
+                'tdMode': 'cross',
+                'side': closing_side,
+                'ordType': 'sl',
+                'sz': amount_precise,
+                'slTriggerPx': payload['slTriggerPx'],
+                'slOrdPx': '0',
+                'slTriggerPxType': trigger_type,
+                'algoClOrdId': f"{BOT_NAME}_{pos_label}_SL",
+            }
+            if payload.get('posSide'):
+                sl_payload['posSide'] = payload['posSide']
+            order_algo(sl_payload)
+
+        logger.info("已通过 order-algo 同步位置止盈止损")
+
     except AttributeError:
-        logger.warning("当前 ccxt 版本缺少 setPositionTpSl，且无法直接调用原始接口")
+        logger.warning("当前 ccxt 版本缺少位置保护相关接口，无法刷新止盈止损")
     except Exception as exc:  # noqa: BLE001
         logger.warning("位置止盈止损同步失败：%s", exc)
 
