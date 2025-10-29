@@ -153,6 +153,7 @@ def setup_exchange():
         contract_size = float(btc_market['contractSize'])
         TRADE_CONFIG['contract_size'] = contract_size
         TRADE_CONFIG['min_amount'] = btc_market['limits']['amount']['min']
+        TRADE_CONFIG['inst_id'] = btc_market.get('id', TRADE_CONFIG['symbol'])
         logger.info("合约规格：1 张 = %.6f BTC", contract_size)
         logger.info("最小下单数量：%s 张", TRADE_CONFIG['min_amount'])
 
@@ -636,6 +637,71 @@ def build_order_params(
         params.setdefault('tdMode', 'cross')
 
     return params
+
+
+def synchronize_position_protection(
+    position: Optional[Dict[str, Any]],
+    stop_loss: Optional[float],
+    take_profit: Optional[float],
+    signal_side: Optional[str] = None,
+):
+    """确保现有持仓的止盈止损与最新信号保持一致。"""
+
+    if TRADE_CONFIG.get('test_mode'):
+        return
+
+    if position is None or position.get('size', 0) <= 0:
+        return
+
+    if (stop_loss is None or stop_loss <= 0) and (take_profit is None or take_profit <= 0):
+        return
+
+    set_tp_sl = getattr(exchange, 'privatePostTradeSetPositionTpsl', None)
+    if set_tp_sl is None:
+        logger.warning("当前 ccxt 客户端不支持 setPositionTpSl 接口，跳过位置保护刷新")
+        return
+
+    trigger_type = os.getenv('OKX_TRIGGER_PX_TYPE', 'last')
+
+    try:
+        market = exchange.market(TRADE_CONFIG['symbol'])
+        inst_id = market.get('id', TRADE_CONFIG.get('inst_id', TRADE_CONFIG['symbol']))
+    except Exception:
+        inst_id = TRADE_CONFIG.get('inst_id', TRADE_CONFIG['symbol'])
+
+    payload: Dict[str, Any] = {
+        'instId': inst_id,
+        'tdMode': 'cross',
+    }
+
+    pos_side = position.get('side')
+    if pos_side in ('long', 'short'):
+        payload['posSide'] = pos_side
+    elif signal_side in ('BUY', 'SELL'):
+        payload['posSide'] = 'long' if signal_side == 'BUY' else 'short'
+
+    def _assign(price: Optional[float], trigger_key: str, order_key: str, type_key: str) -> None:
+        if price is None or price <= 0:
+            return
+        try:
+            formatted = exchange.price_to_precision(TRADE_CONFIG['symbol'], price)
+        except Exception:  # noqa: BLE001
+            formatted = f"{price:.4f}"
+        payload[trigger_key] = formatted
+        payload[order_key] = '0'
+        payload[type_key] = trigger_type
+
+    _assign(take_profit, 'tpTriggerPx', 'tpOrdPx', 'tpTriggerPxType')
+    _assign(stop_loss, 'slTriggerPx', 'slOrdPx', 'slTriggerPxType')
+
+    if 'tpTriggerPx' not in payload and 'slTriggerPx' not in payload:
+        return
+
+    try:
+        response = set_tp_sl(payload)
+        logger.info("已同步位置止盈止损：%s", response)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("位置止盈止损同步失败：%s", exc)
 
 
 def calculate_atr(df: pd.DataFrame, period: int = 14):
@@ -1415,6 +1481,12 @@ def execute_intelligent_trade(
                         current_position['size'],
                         position_size,
                     )
+                    synchronize_position_protection(
+                        current_position,
+                        stop_loss_price,
+                        take_profit_price,
+                        target_side,
+                    )
             else:
                 if stop_loss_price or take_profit_price:
                     logger.info(
@@ -1511,6 +1583,12 @@ def execute_intelligent_trade(
                         current_position['size'],
                         position_size,
                     )
+                    synchronize_position_protection(
+                        current_position,
+                        stop_loss_price,
+                        take_profit_price,
+                        target_side,
+                    )
             else:
                 if stop_loss_price or take_profit_price:
                     logger.info(
@@ -1536,6 +1614,12 @@ def execute_intelligent_trade(
         time.sleep(2)
         updated_position = get_current_position()
         logger.info("更新后的持仓：%s", updated_position)
+        synchronize_position_protection(
+            updated_position,
+            stop_loss_price,
+            take_profit_price,
+            target_side,
+        )
         return updated_position
 
     except Exception as exc:  # noqa: BLE001 - need stack for exchange failures
@@ -1559,6 +1643,12 @@ def execute_intelligent_trade(
             except Exception as nested_exc:  # noqa: BLE001
                 logger.exception("备用下单失败：%s", nested_exc)
 
+    synchronize_position_protection(
+        current_position,
+        stop_loss_price,
+        take_profit_price,
+        signal_data.get('signal'),
+    )
     return current_position
 
 
